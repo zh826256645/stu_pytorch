@@ -1,107 +1,69 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Feb 13 20:07:17 2019
-
-@author: icetong
-"""
 import os
 
-import torch
-import torch.nn as nn
-
-# from models import CNN
-from models import DenseNet
-from datasets import CaptchaData
-from torchvision.transforms import Compose, ToTensor
 import matplotlib.pyplot as plot
+import torch
+from torchvision.transforms import Compose, ToTensor
 
-model_path = "./checkpoints/model.pth"
+from datasets import CaptchaData, alphabet
+from models import DenseNet
 
-source = [str(i) for i in range(0, 10)]
-source += [chr(i) for i in range(97, 97 + 26)]
+model_path = "./checkpoints/model-36.pth"
+num_char = 4
+num_class = len(alphabet)
+device = torch.device(
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
 
-alphabet = "0123456789x=+-"
+
+def load_model():
+    model = DenseNet(num_class=num_class, num_char=num_char, weights=None)
+    model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
+    return model.to(device).eval()
 
 
-def recognize(img, filepath, num_char=4, num_class=36):
-    transforms = Compose([ToTensor()])
-    img = transforms(img)
+def recognize(img, filepath):
+    img = Compose([ToTensor()])(img)
     target_str = os.path.basename(filepath).split(".")[0]
-    assert len(target_str) == num_char
+    if len(target_str) != num_char or any(char not in alphabet for char in target_str):
+        raise ValueError(f"invalid image label: {target_str!r}")
 
-    target = []
-    for char in target_str:
-        vec = [0] * num_class
-        vec[alphabet.find(char)] = 1
-        target += vec
-
-    target = torch.Tensor(target)
-
-    cnn = DenseNet()
-    if torch.cuda.is_available():
-        cnn = cnn.cuda()
-    cnn.eval()
-    cnn.load_state_dict(torch.load(model_path))
-
-    img = img.view(1, 3, 100, 180).cuda()
-    target = target.view(1, 4 * 36).cuda()
-    output = cnn(img)
-
-    output = output.view(-1, 36)
-    target = target.view(-1, 36)
-    output = nn.functional.softmax(output, dim=1)
-    output = torch.argmax(output, dim=1)
-    target = torch.argmax(target, dim=1)
-    output = output.view(-1, 4)[0]
-    target = target.view(-1, 4)[0]
-
-    return "".join([alphabet[i] for i in output.cpu().numpy()]), "".join(
-        [alphabet[i] for i in target.cpu().numpy()]
-    )
+    model = load_model()
+    with torch.inference_mode():
+        output = model(img.view(1, 3, 100, 180).to(device))
+    output = output.view(-1, num_class).argmax(dim=1).view(-1, num_char)[0]
+    prediction = "".join(alphabet[index] for index in output.cpu().numpy())
+    return prediction, target_str
 
 
-def predict(img_dir="./data/test2"):
-    transforms = Compose([ToTensor()])
-    dataset = CaptchaData(img_dir, transform=transforms)
-
-    # cnn = CNN()
-    cnn = DenseNet()
-    if torch.cuda.is_available():
-        cnn = cnn.cuda()
-    cnn.eval()
-    cnn.load_state_dict(torch.load(model_path))
-
+def predict(img_dir="./data/test"):
+    dataset = CaptchaData(img_dir, transform=Compose([ToTensor()]))
+    model = load_model()
     total = 0
-    succ = 0
-    for k, (img, target) in enumerate(dataset):
-        img = img.view(1, 3, 100, 180).cuda()
-        target = target.view(1, 4 * 14).cuda()
-        output = cnn(img)
+    correct = 0
 
-        output = output.view(-1, 14)
-        target = target.view(-1, 14)
-        output = nn.functional.softmax(output, dim=1)
-        output = torch.argmax(output, dim=1)
-        target = torch.argmax(target, dim=1)
-        output = output.view(-1, 4)[0]
-        target = target.view(-1, 4)[0]
+    for img, target in dataset:
+        img = img.view(1, 3, 100, 180).to(device)
+        with torch.inference_mode():
+            output = model(img)
 
-        pred = "".join([alphabet[i] for i in output.cpu().numpy()])
-        print("pred: " + pred)
-        true_str = "".join([alphabet[i] for i in target.cpu().numpy()])
-        print("true: " + true_str)
+        output = output.view(-1, num_class).argmax(dim=1).view(-1, num_char)[0]
+        target = target.view(-1, num_class).argmax(dim=1).view(-1, num_char)[0]
+        prediction = "".join(alphabet[index] for index in output.cpu().numpy())
+        target_str = "".join(alphabet[index] for index in target.cpu().numpy())
+        print(f"pred: {prediction}")
+        print(f"true: {target_str}")
         total += 1
-        if pred == true_str:
-            succ += 1
+        correct += prediction == target_str
 
         plot.imshow(img.permute((0, 2, 3, 1))[0].cpu().numpy())
         plot.show()
 
-        # if k >= 10:
-        #     break
-
     if total:
-        print(f"success rate: {round(succ / total * 100, 2)}%")
+        print(f"success rate: {round(correct / total * 100, 2)}%")
 
 
 if __name__ == "__main__":

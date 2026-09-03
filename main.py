@@ -1,9 +1,3 @@
-import os
-
-if os.environ.get('DISPLAY','') == '':
-    print('no display found. Using :0.0')
-    os.environ.__setitem__('DISPLAY', '192.168.31.239:0.0')
-
 import tkinter as tk
 from tkinter import filedialog
 
@@ -23,6 +17,8 @@ def choose_image(need_file=True):
         file_path = filedialog.askopenfilename()
         if file_path:
             img = Image.open(file_path)
+            img = img.convert("RGB")
+            img = img.resize((180, 100))
     else:
         img = Image.new("RGB", (180, 100), (255, 255, 255))
 

@@ -1,0 +1,11 @@
+[project]
+name = "stu-pytorch"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "matplotlib",
+    "pillow",
+    "requests",
+    "torch",
+    "torchvision",
+]

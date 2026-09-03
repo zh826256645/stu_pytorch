@@ -1,162 +1,64 @@
-# import torch
-# import torch.nn as nn
-# from torch.autograd import Variable
-# from models import CNN
-# # from models import DenseNet
-# from datasets import CaptchaData
-# from torch.utils.data import DataLoader
-# from torchvision.transforms import Compose, ToTensor
-#
-# import matplotlib.pyplot as plt
-# import time
-# import os
-#
-# batch_size = 32
-# base_lr = 0.001
-# max_epoch = 30
-# model_path = './checkpoints/model.pth'
-# restor = False
-#
-# if not os.path.exists('./checkpoints'):
-#     os.mkdir('./checkpoints')
-#
-# def calculat_acc(output, target):
-#     output, target = output.view(-1, 36), target.view(-1, 36)
-#     output = nn.functional.softmax(output, dim=1)
-#     output = torch.argmax(output, dim=1)
-#     target = torch.argmax(target, dim=1)
-#     output, target = output.view(-1, 4), target.view(-1, 4)
-#     correct_list = []
-#     for i, j in zip(target, output):
-#         if torch.equal(i, j):
-#             correct_list.append(1)
-#         else:
-#             correct_list.append(0)
-#     acc = sum(correct_list) / len(correct_list)
-#     return acc
-#
-# def train():
-#     transforms = Compose([ToTensor()])
-#     train_dataset = CaptchaData('./data/train', transform=transforms)
-#     train_data_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=0,
-#                              shuffle=True, drop_last=True)
-#     test_data = CaptchaData('./data/test', transform=transforms)
-#     test_data_loader = DataLoader(test_data, batch_size=batch_size,
-#                                   num_workers=0, shuffle=True, drop_last=True)
-#     # cnn = DenseNet()
-#     cnn = CNN()
-#     if torch.cuda.is_available():
-#         cnn.cuda()
-#     if restor:
-#         cnn.load_state_dict(torch.load(model_path))
-# #        freezing_layers = list(cnn.named_parameters())[:10]
-# #        for param in freezing_layers:
-# #            param[1].requires_grad = False
-# #            print('freezing layer:', param[0])
-#
-#     optimizer = torch.optim.Adam(cnn.parameters(), lr=base_lr)
-#     criterion = nn.MultiLabelSoftMarginLoss()
-#
-#
-#     for epoch in range(max_epoch):
-#         start_ = time.time()
-#
-#         loss_history = []
-#         acc_history = []
-#         cnn.train()
-#         for img, target in train_data_loader:
-#             img = Variable(img)
-#             target = Variable(target)
-#             if torch.cuda.is_available():
-#                 img = img.cuda()
-#                 target = target.cuda()
-#             output = cnn(img)
-#             loss = criterion(output, target)
-#             optimizer.zero_grad()
-#             loss.backward()
-#             optimizer.step()
-#
-#             acc = calculat_acc(output, target)
-#             acc_history.append(float(acc))
-#             loss_history.append(float(loss))
-#         print('train_loss: {:.4}|train_acc: {:.4}'.format(
-#                 torch.mean(torch.Tensor(loss_history)),
-#                 torch.mean(torch.Tensor(acc_history)),
-#                 ))
-#
-#         loss_history = []
-#         acc_history = []
-#         cnn.eval()
-#         for img, target in test_data_loader:
-#             img = Variable(img)
-#             target = Variable(target)
-#             if torch.cuda.is_available():
-#                 img = img.cuda()
-#                 target = target.cuda()
-#             output = cnn(img)
-#
-#             acc = calculat_acc(output, target)
-#             acc_history.append(float(acc))
-#             loss_history.append(float(loss))
-#         print('test_loss: {:.4}|test_acc: {:.4}'.format(
-#                 torch.mean(torch.Tensor(loss_history)),
-#                 torch.mean(torch.Tensor(acc_history)),
-#                 ))
-#         print('epoch: {}|time: {:.4f}'.format(epoch, time.time()-start_))
-#         torch.save(cnn.state_dict(), model_path)
-#
-
-#
-# if __name__=="__main__":
-#     train()
-#     pass
-
+import argparse
+import os
+import time
 
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
-
-# from models import CNN
-from models import DenseNet
-from datasets import CaptchaData
 from torch.utils.data import DataLoader
 from torchvision.transforms import Compose, ToTensor
-# import matplotlib.pyplot as plt
 
-import time
-import os
-
-torch.cuda.memory_summary(device=None, abbreviated=False)
+from datasets import CaptchaData, alphabet
+from models import DenseNet
 
 batch_size = 5
 base_lr = 0.001
 max_epoch = 30
-model_path = "./checkpoints/model.pth"
-restor = False
+model_path = "./checkpoints/model-36.pth"
+num_char = 4
+num_class = len(alphabet)
+device = torch.device(
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
 
-if not os.path.exists("./checkpoints"):
-    os.mkdir("./checkpoints")
-
-
-def calculat_acc(output, target):
-    output, target = output.view(-1, 14), target.view(-1, 14)
-    output = nn.functional.softmax(output, dim=1)
-    output = torch.argmax(output, dim=1)
-    target = torch.argmax(target, dim=1)
-    output, target = output.view(-1, 4), target.view(-1, 4)
-    correct_list = []
-    for i, j in zip(target, output):
-        if torch.equal(i, j):
-            correct_list.append(1)
-        else:
-            correct_list.append(0)
-    acc = sum(correct_list) / len(correct_list)
-    return acc
+os.makedirs("./checkpoints", exist_ok=True)
 
 
-def train():
+def calculate_acc(output, target):
+    output = output.view(-1, num_char, num_class).argmax(dim=2)
+    target = target.view(-1, num_char, num_class).argmax(dim=2)
+    return (output == target).all(dim=1).float().mean().item()
+
+
+def calculate_loss(output, target, criterion):
+    if isinstance(criterion, nn.CrossEntropyLoss):
+        output = output.view(-1, num_class)
+        target = target.view(-1, num_class).argmax(dim=1)
+    return criterion(output, target)
+
+
+def train(
+    classifier_only=False,
+    loss_name="multi-label",
+    learning_rate=base_lr,
+    backbone_learning_rate=None,
+):
+    if learning_rate <= 0 or (
+        backbone_learning_rate is not None and backbone_learning_rate <= 0
+    ):
+        raise ValueError("learning rates must be positive")
+
+    torch.manual_seed(0)
+    print(
+        f"device: {device}|loss: {loss_name}|classifier_only: {classifier_only}"
+        f"|lr: {learning_rate}|backbone_lr: {backbone_learning_rate}"
+    )
+
     transforms = Compose([ToTensor()])
-    train_dataset = CaptchaData("./data/train2", transform=transforms)
+    train_dataset = CaptchaData("./data/train", transform=transforms)
     train_data_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -164,99 +66,112 @@ def train():
         shuffle=True,
         drop_last=True,
     )
-    test_data = CaptchaData("./data/test2", transform=transforms)
+    test_dataset = CaptchaData("./data/test", transform=transforms)
     test_data_loader = DataLoader(
-        test_data, batch_size=batch_size, num_workers=0, shuffle=True, drop_last=True
+        test_dataset, batch_size=batch_size, num_workers=0, shuffle=False
     )
-    cnn = DenseNet()
-    # cnn = CNN()
-    if torch.cuda.is_available():
-        cnn.cuda()
-    if restor:
-        cnn.load_state_dict(torch.load(model_path))
-    #        freezing_layers = list(cnn.named_parameters())[:10]
-    #        for param in freezing_layers:
-    #            param[1].requires_grad = False
-    #            print('freezing layer:', param[0])
 
-    optimizer = torch.optim.Adam(cnn.parameters(), lr=base_lr)
-    criterion = nn.MultiLabelSoftMarginLoss()
+    model = DenseNet(num_class=num_class, num_char=num_char).to(device)
+    if classifier_only:
+        model.densenet.features.requires_grad_(False)
+        assert not any(
+            parameter.requires_grad for parameter in model.densenet.features.parameters()
+        )
 
-    train_loss_history = []
-    train_acc_history = []
-    test_loss_history = []
-    test_acc_history = []
+    if classifier_only:
+        parameters = model.densenet.classifier.parameters()
+    elif backbone_learning_rate is not None:
+        parameters = [
+            {
+                "params": model.densenet.features.parameters(),
+                "lr": backbone_learning_rate,
+            },
+            {"params": model.densenet.classifier.parameters(), "lr": learning_rate},
+        ]
+    else:
+        parameters = model.parameters()
+
+    optimizer = torch.optim.Adam(parameters, lr=learning_rate)
+    expected_lrs = (
+        [backbone_learning_rate, learning_rate]
+        if backbone_learning_rate is not None and not classifier_only
+        else [learning_rate]
+    )
+    assert [group["lr"] for group in optimizer.param_groups] == expected_lrs
+    criterion = (
+        nn.CrossEntropyLoss()
+        if loss_name == "cross-entropy"
+        else nn.MultiLabelSoftMarginLoss()
+    )
+    best_score = (-1.0, float("-inf"))
 
     for epoch in range(max_epoch):
-        start_ = time.time()
+        start = time.time()
+        train_losses = []
+        train_accuracies = []
+        model.train()
+        if classifier_only:
+            model.densenet.features.eval()
 
-        train_loss_list = []
-        train_acc_list = []
-        cnn.train()
         for img, target in train_data_loader:
-            img = Variable(img)
-            target = Variable(target)
-            if torch.cuda.is_available():
-                img = img.cuda()
-                target = target.cuda()
-            output = cnn(img)
-            loss = criterion(output, target)
+            img = img.to(device)
+            target = target.to(device)
+            output = model(img)
+            loss = calculate_loss(output, target, criterion)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            train_accuracies.append(calculate_acc(output, target))
+            train_losses.append(loss.item())
 
-            acc = calculat_acc(output, target)
-            train_acc_list.append(float(acc))
-            train_loss_list.append(float(loss))
-        train_loss = torch.mean(torch.Tensor(train_loss_list))
-        train_acc = torch.mean(torch.Tensor(train_acc_list))
-        train_loss_history.append(train_loss)
-        train_acc_history.append(train_acc)
-        print("train_loss: {:.4}|train_acc: {:.4}".format(train_loss, train_acc))
+        train_loss = sum(train_losses) / len(train_losses)
+        train_acc = sum(train_accuracies) / len(train_accuracies)
+        print(f"train_loss: {train_loss:.4}|train_acc: {train_acc:.4}")
 
-        test_loss_list = []
-        test_acc_list = []
-        cnn.eval()
-        for img, target in test_data_loader:
-            img = Variable(img)
-            target = Variable(target)
-            if torch.cuda.is_available():
-                img = img.cuda()
-                target = target.cuda()
-            output = cnn(img)
+        test_loss_total = 0.0
+        test_correct = 0.0
+        test_size = 0
+        model.eval()
+        with torch.inference_mode():
+            for img, target in test_data_loader:
+                img = img.to(device)
+                target = target.to(device)
+                output = model(img)
+                loss = calculate_loss(output, target, criterion)
+                current_batch_size = img.size(0)
+                test_size += current_batch_size
+                test_correct += calculate_acc(output, target) * current_batch_size
+                test_loss_total += loss.item() * current_batch_size
 
-            acc = calculat_acc(output, target)
-            test_acc_list.append(float(acc))
-            test_loss_list.append(float(loss))
-        test_loss = torch.mean(torch.Tensor(test_loss_list))
-        test_acc = torch.mean(torch.Tensor(test_acc_list))
-        test_loss_history.append(test_loss)
-        test_acc_history.append(test_acc)
-        print("test_loss: {:.4}|test_acc: {:.4}".format(test_loss, test_acc))
-        print("epoch: {}|time: {:.4f}".format(epoch, time.time() - start_))
-        torch.save(cnn.state_dict(), model_path)
+        test_loss = test_loss_total / test_size
+        test_acc = test_correct / test_size
+        print(f"test_loss: {test_loss:.4}|test_acc: {test_acc:.4}")
+        print(f"epoch: {epoch}|time: {time.time() - start:.4f}")
 
-    # Plotting the accuracy and loss curves
-    # plt.figure(figsize=(10, 5))
-    # plt.subplot(1, 2, 1)
-    # plt.plot(train_acc_history, label="Train Accuracy")
-    # plt.plot(test_acc_history, label="Test Accuracy")
-    # plt.xlabel("Epoch")
-    # plt.ylabel("Accuracy")
-    # plt.title("Accuracy Curve")
-    # plt.legend()
-
-    # plt.subplot(1, 2, 2)
-    # plt.plot(train_loss_history, label="Train Loss")
-    # plt.plot(test_loss_history, label="Test Loss")
-    # plt.xlabel("Epoch")
-    # plt.ylabel("Loss")
-    # plt.title("Loss Curve")
-    # plt.legend()
-
-    # plt.tight_layout()
-    # plt.show()
+        score = (round(test_acc, 6), -test_loss)
+        if score > best_score:
+            best_score = score
+            torch.save(model.state_dict(), model_path)
+            assert os.path.getsize(model_path) > 0
+            print(
+                f"saved_best: epoch={epoch}|test_acc={test_acc:.4f}"
+                f"|test_loss={test_loss:.4f}"
+            )
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--classifier-only",
+        action="store_true",
+        help="freeze DenseNet features and train only the classifier",
+    )
+    parser.add_argument(
+        "--loss",
+        choices=("multi-label", "cross-entropy"),
+        default="multi-label",
+    )
+    parser.add_argument("--lr", type=float, default=base_lr)
+    parser.add_argument("--backbone-lr", type=float)
+    args = parser.parse_args()
+    train(args.classifier_only, args.loss, args.lr, args.backbone_lr)
