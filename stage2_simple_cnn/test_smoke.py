@@ -22,8 +22,16 @@ images = image.unsqueeze(0)
 targets = target.unsqueeze(0)
 
 model = SimpleCaptchaCNN()
+batch_norm_layers = [
+    layer for layer in model.features if isinstance(layer, torch.nn.BatchNorm2d)
+]
+assert [layer.num_features for layer in batch_norm_layers] == [16, 32]
+assert isinstance(model.classifier, torch.nn.Sequential)
 assert isinstance(model.classifier[0], torch.nn.Dropout)
 assert model.classifier[0].p == 0.1
+assert isinstance(model.classifier[1], torch.nn.Linear)
+assert model.classifier[1].in_features == 32 * 12 * 22
+assert model.classifier[1].out_features == 4 * len(alphabet)
 logits = model(images)
 assert logits.shape == (1, 4, len(alphabet))
 
