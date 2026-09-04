@@ -2,9 +2,9 @@ import torch
 from torchvision.transforms import ToTensor
 
 from datasets import CaptchaData, alphabet
+
 from .models import DenseNet
 from .train import calculate_loss
-
 
 image, target = CaptchaData("./data/test", transform=ToTensor())[0]
 model = DenseNet(weights=None).eval()

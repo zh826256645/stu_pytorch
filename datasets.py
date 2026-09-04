@@ -5,6 +5,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+DEFAULT_NUM_CLASS = len(alphabet)
 
 
 def img_loader(img_path):
@@ -38,7 +39,7 @@ class CaptchaData(Dataset):
     def __init__(
         self,
         data_path,
-        num_class=len(alphabet),
+        num_class=DEFAULT_NUM_CLASS,
         num_char=4,
         transform=None,
         target_transform=None,
