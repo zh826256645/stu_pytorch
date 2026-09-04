@@ -11,6 +11,7 @@ from torchvision.transforms import Compose, ToTensor
 from datasets import CaptchaData, alphabet
 from training_config import TrainingConfig
 from training_curves import TrainingCurvePlotter
+from training_metrics import calculate_accuracy_counts
 
 from .models import DenseNet
 
@@ -33,12 +34,6 @@ DEFAULT_TRAINING_CONFIG = TrainingConfig(
 )
 
 os.makedirs("./stage1_densenet121/checkpoints", exist_ok=True)
-
-
-def calculate_acc(output, target):
-    output = output.view(-1, num_char, num_class).argmax(dim=2)
-    target = target.view(-1, num_char, num_class).argmax(dim=2)
-    return (output == target).all(dim=1).float().mean().item()
 
 
 def calculate_loss(output, target, criterion):
@@ -134,8 +129,10 @@ def train(
 
     for epoch in range(1, config.epochs + 1):
         start = time.time()
-        train_losses = []
-        train_accuracies = []
+        train_loss_total = 0.0
+        train_correct_captchas = 0
+        train_correct_characters = 0
+        train_size = 0
         model.train()
         if classifier_only:
             model.densenet.features.eval()
@@ -148,14 +145,26 @@ def train(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            train_accuracies.append(calculate_acc(output, target))
-            train_losses.append(loss.item())
 
-        train_loss = sum(train_losses) / len(train_losses)
-        train_acc = sum(train_accuracies) / len(train_accuracies)
+            current_batch_size = img.size(0)
+            accuracy_counts = calculate_accuracy_counts(
+                output,
+                target,
+                num_char=num_char,
+                num_class=num_class,
+            )
+            train_size += current_batch_size
+            train_loss_total += loss.item() * current_batch_size
+            train_correct_captchas += accuracy_counts.correct_captchas
+            train_correct_characters += accuracy_counts.correct_characters
+
+        train_loss = train_loss_total / train_size
+        train_acc = train_correct_captchas / train_size
+        train_character_acc = train_correct_characters / (train_size * num_char)
 
         test_loss_total = 0.0
-        test_correct = 0.0
+        test_correct_captchas = 0
+        test_correct_characters = 0
         test_size = 0
         model.eval()
         with torch.inference_mode():
@@ -165,18 +174,28 @@ def train(
                 output = model(img)
                 loss = calculate_loss(output, target, criterion)
                 current_batch_size = img.size(0)
+                accuracy_counts = calculate_accuracy_counts(
+                    output,
+                    target,
+                    num_char=num_char,
+                    num_class=num_class,
+                )
                 test_size += current_batch_size
-                test_correct += calculate_acc(output, target) * current_batch_size
+                test_correct_captchas += accuracy_counts.correct_captchas
+                test_correct_characters += accuracy_counts.correct_characters
                 test_loss_total += loss.item() * current_batch_size
 
         test_loss = test_loss_total / test_size
-        test_acc = test_correct / test_size
+        test_acc = test_correct_captchas / test_size
+        test_character_acc = test_correct_characters / (test_size * num_char)
         print(
             f"第 {epoch:02d}/{config.epochs} 轮 | "
             f"训练 loss: {train_loss:.4f} | "
             f"训练整图准确率: {train_acc:.2%} | "
+            f"训练单字符准确率: {train_character_acc:.2%} | "
             f"验证 loss: {test_loss:.4f} | "
             f"验证整图准确率: {test_acc:.2%} | "
+            f"验证单字符准确率: {test_character_acc:.2%} | "
             f"用时: {time.time() - start:.2f} 秒"
         )
 
@@ -186,6 +205,8 @@ def train(
             validation_loss=test_loss,
             train_accuracy=train_acc,
             validation_accuracy=test_acc,
+            train_character_accuracy=train_character_acc,
+            validation_character_accuracy=test_character_acc,
         )
 
         score = (round(test_acc, 6), -test_loss)

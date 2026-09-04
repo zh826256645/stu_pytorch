@@ -54,7 +54,7 @@ class TrainingConfig:
             "--plot-curves",
             action="store_true",
             default=defaults.plot_curves,
-            help="实时显示训练集和验证集的 loss、整图准确率曲线",
+            help="实时显示训练集和验证集的 loss、整图和单字符准确率曲线",
         )
 
     @classmethod
