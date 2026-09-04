@@ -5,9 +5,9 @@ import torch
 from torchvision.transforms import Compose, ToTensor
 
 from datasets import CaptchaData, alphabet
-from models import DenseNet
+from .models import DenseNet
 
-model_path = "./checkpoints/model-36.pth"
+model_path = "./stage1_densenet121/checkpoints/model-36.pth"
 num_char = 4
 num_class = len(alphabet)
 device = torch.device(

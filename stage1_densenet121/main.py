@@ -3,7 +3,7 @@ from tkinter import filedialog
 
 from PIL import Image, ImageTk
 
-from predict import recognize
+from .predict import recognize
 
 img = None
 file_path = None

@@ -9,12 +9,12 @@ from torchvision import models
 from torchvision.transforms import Compose, ToTensor
 
 from datasets import CaptchaData, alphabet
-from models import DenseNet
+from .models import DenseNet
 
 batch_size = 5
 base_lr = 0.001
 max_epoch = 30
-model_path = "./checkpoints/model-36.pth"
+model_path = "./stage1_densenet121/checkpoints/model-36.pth"
 num_char = 4
 num_class = len(alphabet)
 device = torch.device(
@@ -25,7 +25,7 @@ device = torch.device(
     else "cpu"
 )
 
-os.makedirs("./checkpoints", exist_ok=True)
+os.makedirs("./stage1_densenet121/checkpoints", exist_ok=True)
 
 
 def calculate_acc(output, target):
