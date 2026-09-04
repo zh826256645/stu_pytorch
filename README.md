@@ -45,6 +45,34 @@ brew install python-tk@3.13
 PyTorch 会自动选择可用设备，顺序为 CUDA、Apple MPS、CPU。默认首次训练会下载
 DenseNet121 的 ImageNet 预训练权重，之后使用本机缓存；使用 `--no-pretrained` 时不会下载。
 
+## 代码格式与检查
+
+项目使用 Ruff 统一检查和格式化 Python 代码。Ruff 作为开发依赖记录在 `pyproject.toml`
+和 `uv.lock` 中，执行 `uv sync` 时会一并安装。
+
+```bash
+# 检查代码问题
+uv run ruff check .
+
+# 自动修复可以安全修复的问题
+uv run ruff check . --fix
+
+# 格式化代码
+uv run ruff format .
+
+# 只检查格式，不修改文件
+uv run ruff format --check .
+```
+
+提交代码前推荐运行：
+
+```bash
+uv run ruff check . && uv run ruff format --check .
+```
+
+当前启用了常见代码错误、未使用代码、import 排序、现代 Python 写法和 bug-prone
+模式检查，目标 Python 版本为 3.13，默认行宽为 88。
+
 ## 训练
 
 当前推荐基线：
@@ -56,10 +84,16 @@ uv run python -m stage1_densenet121.train --loss multi-label --lr 0.001 --backbo
 训练 30 轮，每轮评估一次，只将验证准确率最高的权重保存到
 `stage1_densenet121/checkpoints/model-36.pth`；准确率相同时保留 loss 更低的权重。
 
+两个阶段共用的 `--epochs`、`--batch-size`、`--lr` 和 `--plot-curves` 由
+`training_config.py` 中的 `TrainingConfig` 统一定义和校验。两个阶段可以分别设置默认值。
+曲线绘制逻辑统一放在 `training_curves.py` 中。
+
 可用参数：
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
+| `--epochs` | `30` | 训练轮数 |
+| `--batch-size` | `5` | 每批图片数量 |
 | `--loss` | `multi-label` | `multi-label` 或 `cross-entropy` |
 | `--lr` | `0.001` | 分类层学习率；不设置主干学习率时也是全模型学习率 |
 | `--backbone-lr` | 未设置 | 单独指定 DenseNet 特征主干学习率 |
@@ -118,21 +152,58 @@ uv run python -m stage1_densenet121.test_smoke
 该检查会验证数据读取、模型的 144 维输出，以及两种损失函数能否正常计算；不会
 修改训练权重。
 
+## 第二阶段：简单 CNN
+
+第二阶段直接使用项目现有的 4 位验证码数据集，不下载 MNIST 或 CIFAR-10。模型由两层
+`Conv2d`、`ReLU`、`MaxPool2d` 和一个全连接层组成，适合观察每一层的张量形状变化。
+代码中包含面向初学者的中文注释。
+
+先运行冒烟测试，确认数据、模型输出和反向传播正常：
+
+```bash
+uv run python -m stage2_simple_cnn.test_smoke
+```
+
+开始训练：
+
+```bash
+uv run python -m stage2_simple_cnn.train --epochs 10 --batch-size 16 --lr 0.001
+```
+
+训练时实时显示 loss 和整图准确率曲线：
+
+```bash
+uv run python -m stage2_simple_cnn.train --epochs 10 --batch-size 16 --lr 0.001 --plot-curves
+```
+
+第二阶段的共用参数默认值为：`--epochs 10`、`--batch-size 16`、`--lr 0.001`，
+`--plot-curves` 默认关闭。启用曲线后，每轮结束都会刷新训练集和验证集曲线；训练结束后，
+关闭 Matplotlib 窗口程序才会退出。
+
+最佳权重会保存到 `stage2_simple_cnn/checkpoints/model.pth`。模型输入形状为
+`[B, 3, 100, 180]`，输出形状为 `[B, 4, 36]`。其中 `B` 是批量大小，`4` 是字符位置，
+`36` 是每个位置的候选字符数量。训练和验证准确率都采用“4 个字符全部正确”标准。
+
 ## 文件结构
 
 | 路径 | 用途 |
 | --- | --- |
 | `datasets.py` | 两个阶段共用：从文件名构造标签并加载图片 |
+| `training_config.py` | 两个阶段共用：训练参数类和命令行参数定义 |
+| `training_curves.py` | 两个阶段共用：实时 loss 和整图准确率曲线 |
 | `stage1_densenet121/models.py` | 第一阶段 DenseNet121 和 144 维分类层 |
 | `stage1_densenet121/train.py` | 第一阶段训练、验证和最佳权重保存 |
 | `stage1_densenet121/predict.py` | 第一阶段单张识别与测试集逐张预测 |
 | `stage1_densenet121/main.py` | 第一阶段 Tkinter 桌面界面 |
 | `stage1_densenet121/test_smoke.py` | 第一阶段最小可运行检查 |
 | `stage1_densenet121/checkpoints/model-36.pth` | 第一阶段 DenseNet121 权重 |
+| `stage2_simple_cnn/models.py` | 带中文注释的两层简单 CNN |
+| `stage2_simple_cnn/train.py` | 第二阶段训练、验证和最佳权重保存 |
+| `stage2_simple_cnn/test_smoke.py` | 第二阶段数据、前向传播和反向传播检查 |
 | `data/train2`、`data/test2` | 旧算式验证码数据，当前训练不使用 |
 | `checkpoints/model.pth` | 旧算式验证码权重，当前代码不使用 |
 
-第二阶段的简单 CNN 将在后续加入独立目录，复用根目录下的数据加载逻辑。
+第二阶段的简单 CNN 位于 `stage2_simple_cnn`，复用根目录下的 `datasets.py` 数据加载逻辑。
 
 `get_imgs.py` 是旧算式验证码的下载脚本，当前 36 类训练流程不使用。
 
