@@ -5,6 +5,7 @@ import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torchvision import models
 from torchvision.transforms import Compose, ToTensor
 
 from datasets import CaptchaData, alphabet
@@ -45,6 +46,8 @@ def train(
     loss_name="multi-label",
     learning_rate=base_lr,
     backbone_learning_rate=None,
+    pretrained=True,
+    plot_curves=False,
 ):
     if learning_rate <= 0 or (
         backbone_learning_rate is not None and backbone_learning_rate <= 0
@@ -54,8 +57,42 @@ def train(
     torch.manual_seed(0)
     print(
         f"device: {device}|loss: {loss_name}|classifier_only: {classifier_only}"
+        f"|pretrained: {pretrained}|plot_curves: {plot_curves}"
         f"|lr: {learning_rate}|backbone_lr: {backbone_learning_rate}"
     )
+
+    plotter = None
+    if plot_curves:
+        import matplotlib.pyplot as plt
+
+        plotter = plt
+        plotter.ion()
+        figure, (loss_axis, accuracy_axis) = plotter.subplots(
+            1, 2, figsize=(12, 4)
+        )
+        figure.suptitle("Training Curves")
+        loss_axis.set_title("Loss")
+        loss_axis.set_xlabel("Epoch")
+        loss_axis.set_ylabel("Loss")
+        train_loss_line, = loss_axis.plot([], [], label="train")
+        test_loss_line, = loss_axis.plot([], [], label="test")
+        loss_axis.legend()
+        accuracy_axis.set_title("Exact-match Accuracy")
+        accuracy_axis.set_xlabel("Epoch")
+        accuracy_axis.set_ylabel("Accuracy")
+        accuracy_axis.set_ylim(0, 1)
+        train_accuracy_line, = accuracy_axis.plot([], [], label="train")
+        test_accuracy_line, = accuracy_axis.plot([], [], label="test")
+        accuracy_axis.legend()
+        plotter.show(block=False)
+
+    history = {
+        "epochs": [],
+        "train_loss": [],
+        "test_loss": [],
+        "train_acc": [],
+        "test_acc": [],
+    }
 
     transforms = Compose([ToTensor()])
     train_dataset = CaptchaData("./data/train", transform=transforms)
@@ -71,7 +108,15 @@ def train(
         test_dataset, batch_size=batch_size, num_workers=0, shuffle=False
     )
 
-    model = DenseNet(num_class=num_class, num_char=num_char).to(device)
+    model = DenseNet(
+        num_class=num_class,
+        num_char=num_char,
+        weights=(
+            models.DenseNet121_Weights.DEFAULT
+            if pretrained
+            else None
+        ),
+    ).to(device)
     if classifier_only:
         model.densenet.features.requires_grad_(False)
         assert not any(
@@ -148,6 +193,27 @@ def train(
         print(f"test_loss: {test_loss:.4}|test_acc: {test_acc:.4}")
         print(f"epoch: {epoch}|time: {time.time() - start:.4f}")
 
+        if plotter is not None:
+            history["epochs"].append(epoch)
+            history["train_loss"].append(train_loss)
+            history["test_loss"].append(test_loss)
+            history["train_acc"].append(train_acc)
+            history["test_acc"].append(test_acc)
+
+            epochs = history["epochs"]
+            train_loss_line.set_data(epochs, history["train_loss"])
+            test_loss_line.set_data(epochs, history["test_loss"])
+            train_accuracy_line.set_data(epochs, history["train_acc"])
+            test_accuracy_line.set_data(epochs, history["test_acc"])
+            loss_axis.relim()
+            loss_axis.autoscale_view()
+            accuracy_axis.relim()
+            accuracy_axis.set_ylim(0, 1)
+            accuracy_axis.autoscale_view(scaley=False)
+            figure.canvas.draw_idle()
+            figure.canvas.flush_events()
+            plotter.pause(0.001)
+
         score = (round(test_acc, 6), -test_loss)
         if score > best_score:
             best_score = score
@@ -157,6 +223,10 @@ def train(
                 f"saved_best: epoch={epoch}|test_acc={test_acc:.4f}"
                 f"|test_loss={test_loss:.4f}"
             )
+
+    if plotter is not None:
+        plotter.ioff()
+        plotter.show()
 
 
 if __name__ == "__main__":
@@ -173,5 +243,22 @@ if __name__ == "__main__":
     )
     parser.add_argument("--lr", type=float, default=base_lr)
     parser.add_argument("--backbone-lr", type=float)
+    parser.add_argument(
+        "--no-pretrained",
+        action="store_true",
+        help="do not load ImageNet-pretrained DenseNet121 weights",
+    )
+    parser.add_argument(
+        "--plot-curves",
+        action="store_true",
+        help="show live training and validation curves",
+    )
     args = parser.parse_args()
-    train(args.classifier_only, args.loss, args.lr, args.backbone_lr)
+    train(
+        args.classifier_only,
+        args.loss,
+        args.lr,
+        args.backbone_lr,
+        pretrained=not args.no_pretrained,
+        plot_curves=args.plot_curves,
+    )

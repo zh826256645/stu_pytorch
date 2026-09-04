@@ -35,8 +35,8 @@ macOS 运行 Tkinter GUI 还需要：
 brew install python-tk@3.13
 ```
 
-PyTorch 会自动选择可用设备，顺序为 CUDA、Apple MPS、CPU。首次训练会下载
-DenseNet121 的 ImageNet 预训练权重，之后使用本机缓存。
+PyTorch 会自动选择可用设备，顺序为 CUDA、Apple MPS、CPU。默认首次训练会下载
+DenseNet121 的 ImageNet 预训练权重，之后使用本机缓存；使用 `--no-pretrained` 时不会下载。
 
 ## 训练
 
@@ -57,6 +57,8 @@ uv run python train.py --loss multi-label --lr 0.001
 | `--lr` | `0.001` | 分类层学习率；不设置主干学习率时也是全模型学习率 |
 | `--backbone-lr` | 未设置 | 单独指定 DenseNet 特征主干学习率 |
 | `--classifier-only` | 关闭 | 冻结 DenseNet 特征层，只训练分类层 |
+| `--no-pretrained` | 关闭 | 不加载 ImageNet 预训练权重，从随机初始化开始训练 |
+| `--plot-curves` | 关闭 | 实时显示训练集/验证集的 loss 和整张验证码准确率曲线 |
 
 示例：
 
@@ -66,7 +68,16 @@ uv run python train.py --classifier-only --loss multi-label --lr 0.001
 
 # 主干和分类层使用不同学习率
 uv run python train.py --loss multi-label --lr 0.001 --backbone-lr 0.0001
+
+# 不使用 ImageNet 预训练权重，从随机初始化开始训练
+uv run python train.py --no-pretrained --loss multi-label --lr 0.001
+
+# 实时显示训练曲线
+uv run python train.py --plot-curves --loss multi-label --lr 0.001
 ```
+
+启用 `--plot-curves` 后会打开一个 Matplotlib 窗口，每轮结束后更新两张图：
+训练集/验证集 loss，以及训练集/验证集的整张验证码准确率。训练结束后关闭图表窗口，程序才会退出。
 
 一次本机参考实验在第 27 轮达到 `99.74%`，即 381 张验证图片中正确 380 张。
 该结果仅反映当前数据集，不代表其他验证码来源的识别率。
