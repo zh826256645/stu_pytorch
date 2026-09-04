@@ -18,7 +18,8 @@
 - 训练集：`data/train`，800 张
 - 验证集：`data/test`，381 张
 - 权重：`stage1_densenet121/checkpoints/model-36.pth`
-- 准确率：4 个字符全部正确才计为一次正确
+- 整图准确率：4 个字符全部正确的图片数 ÷ 图片总数
+- 单字符准确率：预测正确的字符位置数 ÷ 字符位置总数
 
 当前数据文件名均为 4 个字符，例如 `25mb.png`。文件名（不含扩展名）就是监督
 标签。当前数据实际只覆盖 `2345678abcdefgmnpwxy` 这 20 个字符，因此训练出的
@@ -81,8 +82,9 @@ uv run ruff check . && uv run ruff format --check .
 uv run python -m stage1_densenet121.train --loss multi-label --lr 0.001 --backbone-lr 0.0003
 ```
 
-训练 30 轮，每轮评估一次，只将验证准确率最高的权重保存到
-`stage1_densenet121/checkpoints/model-36.pth`；准确率相同时保留 loss 更低的权重。
+训练 30 轮，每轮评估一次，同时输出整图准确率和单字符准确率。只将验证整图准确率
+最高的权重保存到 `stage1_densenet121/checkpoints/model-36.pth`；整图准确率相同时保留
+loss 更低的权重。
 
 两个阶段共用的 `--epochs`、`--batch-size`、`--lr` 和 `--plot-curves` 由
 `training_config.py` 中的 `TrainingConfig` 统一定义和校验。两个阶段可以分别设置默认值。
@@ -99,7 +101,7 @@ uv run python -m stage1_densenet121.train --loss multi-label --lr 0.001 --backbo
 | `--backbone-lr` | 未设置 | 单独指定 DenseNet 特征主干学习率 |
 | `--classifier-only` | 关闭 | 冻结 DenseNet 特征层，只训练分类层 |
 | `--no-pretrained` | 关闭 | 不加载 ImageNet 预训练权重，从随机初始化开始训练 |
-| `--plot-curves` | 关闭 | 实时显示训练集/验证集的 loss 和整张验证码准确率曲线 |
+| `--plot-curves` | 关闭 | 实时显示训练集/验证集的 loss、整图准确率和单字符准确率曲线 |
 
 示例：
 
@@ -117,8 +119,8 @@ uv run python -m stage1_densenet121.train --no-pretrained --loss multi-label --l
 uv run python -m stage1_densenet121.train --plot-curves --loss multi-label --lr 0.001
 ```
 
-启用 `--plot-curves` 后会打开一个 Matplotlib 窗口，每轮结束后更新两张图：
-训练集/验证集 loss，以及训练集/验证集的整张验证码准确率。训练结束后关闭图表窗口，程序才会退出。
+启用 `--plot-curves` 后会打开一个 Matplotlib 窗口，每轮结束后更新三张图：
+训练集/验证集 loss、整图准确率和单字符准确率。训练结束后关闭图表窗口，程序才会退出。
 
 使用推荐的分层学习率时，一次本机参考实验达到 `99.21%`，即 381 张验证图片中
 正确 378 张。该结果仅反映当前数据集，不代表其他验证码来源的识别率。
@@ -154,9 +156,9 @@ uv run python -m stage1_densenet121.test_smoke
 
 ## 第二阶段：简单 CNN
 
-第二阶段直接使用项目现有的 4 位验证码数据集，不下载 MNIST 或 CIFAR-10。模型由两层
-`Conv2d`、`ReLU`、`MaxPool2d` 和一个全连接层组成，适合观察每一层的张量形状变化。
-代码中包含面向初学者的中文注释。
+第二阶段直接使用项目现有的 4 位验证码数据集，不下载 MNIST 或 CIFAR-10。当前推荐模型
+由三个 `Conv2d → BatchNorm2d → ReLU → MaxPool2d` 卷积块和一个全连接层组成，适合观察
+每一层的张量形状变化。代码中包含面向初学者的中文注释。
 
 先运行冒烟测试，确认数据、模型输出和反向传播正常：
 
@@ -170,19 +172,56 @@ uv run python -m stage2_simple_cnn.test_smoke
 uv run python -m stage2_simple_cnn.train --epochs 10 --batch-size 16 --lr 0.001
 ```
 
-训练时实时显示 loss 和整图准确率曲线：
+验证新增第三个卷积块时，保持数据增强和学习率调度关闭，只改变模型结构：
+
+```bash
+uv run python -m stage2_simple_cnn.train \
+  --epochs 30 \
+  --batch-size 16 \
+  --lr 0.001
+```
+
+第三个卷积块把通道数从 `32` 增加到 `64`。随后只额外压缩特征图高度，使送入全连接层的
+特征总数仍为 `8448`，避免因为全连接层参数量增加而干扰结构对比。
+
+训练时实时显示 loss、整图准确率和单字符准确率曲线：
 
 ```bash
 uv run python -m stage2_simple_cnn.train --epochs 10 --batch-size 16 --lr 0.001 --plot-curves
 ```
 
+对训练集启用轻量仿射增强（验证集不增强）：
+
+```bash
+uv run python -m stage2_simple_cnn.train --epochs 30 --batch-size 16 --lr 0.001 --augment
+```
+
+`--augment` 会随机执行不超过 `3°` 的旋转、轻微平移、`0.95~1.05` 倍缩放和小幅错切；
+不会执行会破坏验证码字符顺序的翻转或大幅裁剪。
+
+根据验证 loss 自动降低学习率：
+
+```bash
+uv run python -m stage2_simple_cnn.train \
+  --epochs 30 \
+  --batch-size 16 \
+  --lr 0.001 \
+  --reduce-lr-on-plateau
+```
+
+启用 `--reduce-lr-on-plateau` 后，如果验证 loss 连续多轮没有改善，学习率会降低为原来的
+`30%`，最低降至 `0.00001`。控制变量实验表明该调度器没有提升三卷积块模型的验证指标，
+因此当前推荐训练命令不启用它。
+
 第二阶段的共用参数默认值为：`--epochs 10`、`--batch-size 16`、`--lr 0.001`，
 `--plot-curves` 默认关闭。启用曲线后，每轮结束都会刷新训练集和验证集曲线；训练结束后，
 关闭 Matplotlib 窗口程序才会退出。
 
-最佳权重会保存到 `stage2_simple_cnn/checkpoints/model.pth`。模型输入形状为
-`[B, 3, 100, 180]`，输出形状为 `[B, 4, 36]`。其中 `B` 是批量大小，`4` 是字符位置，
-`36` 是每个位置的候选字符数量。训练和验证准确率都采用“4 个字符全部正确”标准。
+最佳权重会保存到 `stage2_simple_cnn/checkpoints/model.pth`，并继续按验证集整图准确率
+选择。第二阶段只保留这一份默认权重，后续训练会直接覆盖它，不再为每个实验保留单独权重。
+模型输入形状为 `[B, 3, 100, 180]`，输出形状为 `[B, 4, 36]`。其中 `B` 是批量大小，
+`4` 是字符位置，`36` 是每个位置的候选字符数量。训练和验证都会同时输出整图准确率与
+单字符准确率。
 
 ## 文件结构
 
@@ -190,14 +229,15 @@ uv run python -m stage2_simple_cnn.train --epochs 10 --batch-size 16 --lr 0.001 
 | --- | --- |
 | `datasets.py` | 两个阶段共用：从文件名构造标签并加载图片 |
 | `training_config.py` | 两个阶段共用：训练参数类和命令行参数定义 |
-| `training_curves.py` | 两个阶段共用：实时 loss 和整图准确率曲线 |
+| `training_curves.py` | 两个阶段共用：实时 loss、整图准确率和单字符准确率曲线 |
+| `training_metrics.py` | 两个阶段共用：整图与单字符准确率统计 |
 | `stage1_densenet121/models.py` | 第一阶段 DenseNet121 和 144 维分类层 |
 | `stage1_densenet121/train.py` | 第一阶段训练、验证和最佳权重保存 |
 | `stage1_densenet121/predict.py` | 第一阶段单张识别与测试集逐张预测 |
 | `stage1_densenet121/main.py` | 第一阶段 Tkinter 桌面界面 |
 | `stage1_densenet121/test_smoke.py` | 第一阶段最小可运行检查 |
 | `stage1_densenet121/checkpoints/model-36.pth` | 第一阶段 DenseNet121 权重 |
-| `stage2_simple_cnn/models.py` | 带中文注释的两层简单 CNN |
+| `stage2_simple_cnn/models.py` | 带中文注释的三卷积块简单 CNN |
 | `stage2_simple_cnn/train.py` | 第二阶段训练、验证和最佳权重保存 |
 | `stage2_simple_cnn/test_smoke.py` | 第二阶段数据、前向传播和反向传播检查 |
 | `data/train2`、`data/test2` | 旧算式验证码数据，当前训练不使用 |
@@ -218,8 +258,8 @@ uv run python -m stage2_simple_cnn.train --epochs 10 --batch-size 16 --lr 0.001 
 
 ## 第二阶段结构优化实验记录
 
-为减少简单 CNN 全连接层参数并改善泛化能力，实验固定使用以下训练条件，只改变
-模型结构中的单个因素：
+为减少简单 CNN 全连接层参数并改善泛化能力，实验固定使用以下基础训练条件，每次只改变
+一个模型结构或训练策略因素：
 
 ```bash
 uv run python -m stage2_simple_cnn.train \
@@ -241,7 +281,12 @@ uv run python -m stage2_simple_cnn.train \
 | `AvgPool2d(2, 2) + Dropout(0.3)` | 1,221,744 | 40.94% | 75.72% |
 | `AvgPool2d(2, 2) + Dropout(0.1)` | 1,221,744 | 43.83% | 75.85% |
 | `AvgPool2d(2, 2) + BatchNorm`，无 Dropout | 1,221,840 | 44.88% | 77.69% |
-| `AvgPool2d(2, 2) + BatchNorm + Dropout(0.1)` | 1,221,840 | **45.93%** | **77.69%** |
+| `AvgPool2d(2, 2) + BatchNorm + Dropout(0.1)` | 1,221,840 | 45.93% | 77.69% |
+| 两卷积块 + 轻量仿射数据增强 | 1,221,840 | 44.36% | 79.13% |
+| 两卷积块 + `ReduceLROnPlateau` | 1,221,840 | 46.19% | 77.43% |
+| 三卷积块，固定学习率 | 1,240,464 | 57.74% | 84.78% |
+| 三卷积块 + `ReduceLROnPlateau` | 1,240,464 | 57.48% | 84.25% |
+| 三卷积块 + 轻量仿射数据增强 | 1,240,464 | **67.72%** | **89.24%** |
 
 实验结论：
 
@@ -250,11 +295,18 @@ uv run python -m stage2_simple_cnn.train \
 - 将特征图直接压缩至 `5×15` 会丢失过多字符空间信息，整图准确率明显下降，因此不采用。
 - `Dropout(0.3)` 对当前小型 CNN 正则化过强；`Dropout(0.1)` 能提供小幅提升。
 - 两个卷积层采用 `Conv2d → BatchNorm2d → ReLU → MaxPool2d` 后，收敛速度和验证指标
-  均有明显改善。BatchNorm 与 Dropout(0.1) 同时使用时取得当前最高整图准确率 45.93%。
-- 当前推荐结构为 `AvgPool2d(2, 2) + BatchNorm2d + Dropout(0.1)`。验证集训练后期仍与
-  训练集存在较大差距，下一步应优先测试轻度数据增强，而不是继续增大模型。
+  均有明显改善；其中 BatchNorm 与 Dropout(0.1) 同时使用时达到 45.93% 整图准确率。
+- 增加第三个 `32 → 64` 卷积块后，固定学习率实验达到 57.74%，比两卷积块基线提升
+  11.81 个百分点，对应 381 张验证图片中多识别正确 45 张。第三个卷积块显著增强了对字符
+  笔画、轮廓和干扰线组合特征的提取能力。
+- 三卷积块结构使用 `ReduceLROnPlateau` 时达到 57.48%，比固定学习率少正确 1 张，可视为
+  没有提升，因此当前不推荐启用学习率调度。
+- 三卷积块配合轻量仿射数据增强后，第 27 轮同时取得最低验证 loss `0.4360`、最高整图
+  准确率 67.72% 和最高单字符准确率 89.24%。相比不增强的三卷积块多识别正确 38 张，
+  相比两卷积块基线总计提升 21.79 个百分点。
+- 当前推荐配置为三卷积块、Dropout(0.1)、固定学习率 `0.001` 和轻量仿射数据增强；不启用
+  `ReduceLROnPlateau`。最佳权重统一保存在 `stage2_simple_cnn/checkpoints/model.pth`，不再
+  为各次实验保留额外权重文件。
 
-当前代码已经恢复为推荐结构。由于每次训练都会覆盖
-`stage2_simple_cnn/checkpoints/model.pth`，代码结构与磁盘上的权重不一定来自同一次实验；
-需要使用推荐结构重新训练，才能生成对应 45.93% 实验配置的新权重。上述指标来自反复参与
-模型选择的 `data/test`，因此属于验证结果，不是独立测试集上的最终识别率。
+上述指标来自反复参与模型选择的 `data/test`，因此属于验证结果，不是独立测试集上的最终
+识别率。

@@ -4,11 +4,12 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-from torchvision.transforms import ToTensor
+from torchvision.transforms import Compose, RandomAffine, ToTensor
 
 from datasets import CaptchaData, alphabet
 from training_config import TrainingConfig
 from training_curves import TrainingCurvePlotter
+from training_metrics import calculate_accuracy_counts
 
 from .models import SimpleCaptchaCNN
 
@@ -24,6 +25,10 @@ DEFAULT_TRAINING_CONFIG = TrainingConfig(
     batch_size=16,
     learning_rate=0.001,
 )
+# 验证 loss 连续若干轮没有改善时，把学习率降低到原来的 30%。
+PLATEAU_FACTOR = 0.3
+PLATEAU_PATIENCE = 3
+MIN_LEARNING_RATE = 1e-5
 
 
 def get_device() -> torch.device:
@@ -33,6 +38,38 @@ def get_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def build_image_transform(*, augment: bool) -> Compose:
+    """构造图片预处理；训练时可选择轻量仿射增强。"""
+    transforms = []
+    if augment:
+        # 验证码不能翻转，也不宜大幅裁剪。这里只做很小的旋转、平移、缩放和错切，
+        # 模拟字符整体位置和书写角度变化，同时保持 4 个字符的顺序不变。
+        transforms.append(
+            RandomAffine(
+                degrees=3,
+                translate=(0.03, 0.05),
+                scale=(0.95, 1.05),
+                shear=3,
+                fill=255,
+            )
+        )
+    transforms.append(ToTensor())
+    return Compose(transforms)
+
+
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
+    """验证 loss 停止改善时自动降低学习率。"""
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=PLATEAU_FACTOR,
+        patience=PLATEAU_PATIENCE,
+        min_lr=MIN_LEARNING_RATE,
+    )
 
 
 def one_hot_to_class_indices(target: torch.Tensor) -> torch.Tensor:
@@ -64,29 +101,20 @@ def calculate_loss(
     )
 
 
-def count_correct_captchas(logits: torch.Tensor, target: torch.Tensor) -> int:
-    """统计整个验证码完全预测正确的图片数量。
-
-    只有 4 个字符全部正确，才把这张验证码记为正确。
-    """
-    predicted = logits.argmax(dim=2)
-    expected = one_hot_to_class_indices(target)
-    return (predicted == expected).all(dim=1).sum().item()
-
-
 def run_epoch(
     model: SimpleCaptchaCNN,
     data_loader: DataLoader,
     criterion: nn.CrossEntropyLoss,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
-) -> tuple[float, float]:
-    """运行一轮训练或验证，并返回平均 loss 和整图准确率。"""
+) -> tuple[float, float, float]:
+    """运行一轮训练或验证，并返回 loss、整图和单字符准确率。"""
     is_training = optimizer is not None
     model.train(is_training)
 
     total_loss = 0.0
-    total_correct = 0
+    total_correct_captchas = 0
+    total_correct_characters = 0
     total_images = 0
 
     # 训练时需要梯度；验证时关闭梯度可以节省内存和计算量。
@@ -108,16 +136,30 @@ def run_epoch(
                 optimizer.step()
 
             current_batch_size = images.size(0)
+            accuracy_counts = calculate_accuracy_counts(
+                logits,
+                targets,
+                num_char=NUM_CHAR,
+                num_class=NUM_CLASS,
+            )
             total_images += current_batch_size
             total_loss += loss.item() * current_batch_size
-            total_correct += count_correct_captchas(logits, targets)
+            total_correct_captchas += accuracy_counts.correct_captchas
+            total_correct_characters += accuracy_counts.correct_characters
 
-    return total_loss / total_images, total_correct / total_images
+    return (
+        total_loss / total_images,
+        total_correct_captchas / total_images,
+        total_correct_characters / (total_images * NUM_CHAR),
+    )
 
 
 def train(
     config: TrainingConfig = DEFAULT_TRAINING_CONFIG,
     model_path: Path = DEFAULT_MODEL_PATH,
+    *,
+    augment: bool = False,
+    reduce_lr_on_plateau: bool = False,
 ) -> None:
     """训练简单 CNN，并保存验证集表现最好的模型。"""
     # TrainingConfig 创建时已经统一检查 epochs、batch_size 和学习率。
@@ -125,7 +167,8 @@ def train(
     device = get_device()
     print(
         f"使用设备：{device} | 训练轮数：{config.epochs} | "
-        f"批量大小：{config.batch_size} | 学习率：{config.learning_rate} | "
+        f"批量大小：{config.batch_size} | 初始学习率：{config.learning_rate} | "
+        f"学习率调度：{reduce_lr_on_plateau} | 数据增强：{augment} | "
         f"显示曲线：{config.plot_curves}"
     )
 
@@ -135,10 +178,11 @@ def train(
         title="Simple CNN Training Curves",
     )
 
-    # ToTensor 会把 PIL 图片转换为 PyTorch 张量，并把像素值缩放到 0~1。
-    transform = ToTensor()
-    train_dataset = CaptchaData("./data/train", transform=transform)
-    test_dataset = CaptchaData("./data/test", transform=transform)
+    # 只增强训练集，验证集始终只执行 ToTensor，确保不同实验的指标可比较。
+    train_transform = build_image_transform(augment=augment)
+    validation_transform = build_image_transform(augment=False)
+    train_dataset = CaptchaData("./data/train", transform=train_transform)
+    test_dataset = CaptchaData("./data/test", transform=validation_transform)
 
     train_loader = DataLoader(
         train_dataset,
@@ -165,19 +209,21 @@ def train(
         model.parameters(),
         lr=config.learning_rate,
     )
+    scheduler = build_lr_scheduler(optimizer) if reduce_lr_on_plateau else None
 
     model_path.parent.mkdir(parents=True, exist_ok=True)
     best_accuracy = -1.0
 
     for epoch in range(1, config.epochs + 1):
-        train_loss, train_accuracy = run_epoch(
+        current_learning_rate = optimizer.param_groups[0]["lr"]
+        train_loss, train_accuracy, train_character_accuracy = run_epoch(
             model,
             train_loader,
             criterion,
             device,
             optimizer,
         )
-        test_loss, test_accuracy = run_epoch(
+        test_loss, test_accuracy, test_character_accuracy = run_epoch(
             model,
             test_loader,
             criterion,
@@ -186,10 +232,13 @@ def train(
 
         print(
             f"第 {epoch:02d}/{config.epochs} 轮 | "
+            f"学习率: {current_learning_rate:.6f} | "
             f"训练 loss: {train_loss:.4f} | "
             f"训练整图准确率: {train_accuracy:.2%} | "
+            f"训练单字符准确率: {train_character_accuracy:.2%} | "
             f"验证 loss: {test_loss:.4f} | "
-            f"验证整图准确率: {test_accuracy:.2%}"
+            f"验证整图准确率: {test_accuracy:.2%} | "
+            f"验证单字符准确率: {test_character_accuracy:.2%}"
         )
 
         # 两个阶段通过同一个绘图模块显示相同含义的指标。
@@ -199,7 +248,19 @@ def train(
             validation_loss=test_loss,
             train_accuracy=train_accuracy,
             validation_accuracy=test_accuracy,
+            train_character_accuracy=train_character_accuracy,
+            validation_character_accuracy=test_character_accuracy,
         )
+
+        if scheduler is not None:
+            previous_learning_rate = optimizer.param_groups[0]["lr"]
+            scheduler.step(test_loss)
+            next_learning_rate = optimizer.param_groups[0]["lr"]
+            if next_learning_rate < previous_learning_rate:
+                print(
+                    "验证 loss 停止改善，学习率调整："
+                    f"{previous_learning_rate:.6f} -> {next_learning_rate:.6f}"
+                )
 
         # 只保存验证集整图准确率最高的权重。
         if test_accuracy > best_accuracy:
@@ -222,9 +283,21 @@ if __name__ == "__main__":
         default=DEFAULT_MODEL_PATH,
         help="最佳模型权重保存路径",
     )
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="仅对训练集启用轻量旋转、平移、缩放和错切增强",
+    )
+    parser.add_argument(
+        "--reduce-lr-on-plateau",
+        action="store_true",
+        help="验证 loss 停止改善时自动降低学习率",
+    )
     args = parser.parse_args()
 
     train(
         config=TrainingConfig.from_namespace(args),
         model_path=args.model_path,
+        augment=args.augment,
+        reduce_lr_on_plateau=args.reduce_lr_on_plateau,
     )

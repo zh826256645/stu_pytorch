@@ -50,31 +50,44 @@ class SimpleCaptchaCNN(nn.Module):
             # 再次把高和宽缩小一半：
             # [B, 32, 50, 90] -> [B, 32, 25, 45]
             nn.MaxPool2d(kernel_size=2, stride=2),
-            # 控制变量实验：用一次较温和的平均池化压缩送入全连接层的
-            # 空间尺寸，卷积层、激活函数和其他训练配置保持不变。
-            # PyTorch 默认向下取整，因此 25x45 会变为 12x22。
-            # [B, 32, 25, 45] -> [B, 32, 12, 22]
-            nn.AvgPool2d(kernel_size=2, stride=2),
+            # 第三个卷积块进一步提取字符笔画、边缘组合和干扰线特征，
+            # 同时把通道数从 32 增加到 64。
+            # [B, 32, 25, 45] -> [B, 64, 25, 45]
+            nn.Conv2d(
+                in_channels=32,
+                out_channels=64,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            # [B, 64, 25, 45] -> [B, 64, 12, 22]
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # 只继续压缩高度，不压缩宽度，尽量保留 4 个字符的横向位置信息。
+            # 通道数翻倍后，64 * 6 * 22 与原来的 32 * 12 * 22 相同，
+            # 因而全连接层参数量保持不变，便于单独观察第三个卷积块的作用。
+            # [B, 64, 12, 22] -> [B, 64, 6, 22]
+            nn.AvgPool2d(kernel_size=(2, 1), stride=(2, 1)),
         )
 
-        # 平均池化后，每张图片具有 32 * 12 * 22 个特征。
+        # 池化后，每张图片具有 64 * 6 * 22 个特征。
         # 实验结果表明 BatchNorm 与 Dropout(0.1) 组合的验证整图准确率最高。
         # 这里不添加 Softmax，因为 CrossEntropyLoss 内部会完成相应计算。
         self.classifier = nn.Sequential(
             nn.Dropout(p=0.1),
             nn.Linear(
-                in_features=32 * 12 * 22,
+                in_features=64 * 6 * 22,
                 out_features=num_char * num_class,
             ),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """定义数据从输入到输出的前向传播过程。"""
-        # 卷积和平均池化后的形状为 [B, 32, 12, 22]。
+        # 三个卷积块和池化后的形状为 [B, 64, 6, 22]。
         x = self.features(x)
 
         # 从第 1 维开始展平，保留第 0 维的批量大小：
-        # [B, 32, 12, 22] -> [B, 32 * 12 * 22]
+        # [B, 64, 6, 22] -> [B, 64 * 6 * 22]
         x = torch.flatten(x, start_dim=1)
 
         # 得到每张验证码的 4 * 36 个原始分类分数（logits）。
