@@ -47,23 +47,32 @@ class SimpleCaptchaCNN(nn.Module):
             # 再次把高和宽缩小一半：
             # [B, 32, 50, 90] -> [B, 32, 25, 45]
             nn.MaxPool2d(kernel_size=2, stride=2),
+            # 控制变量实验：用一次较温和的平均池化压缩送入全连接层的
+            # 空间尺寸，卷积层、激活函数和其他训练配置保持不变。
+            # PyTorch 默认向下取整，因此 25x45 会变为 12x22。
+            # [B, 32, 25, 45] -> [B, 32, 12, 22]
+            nn.AvgPool2d(kernel_size=2, stride=2),
         )
 
-        # 经过两次池化后，每张图片具有 32 * 25 * 45 个特征。
-        # 全连接层把这些特征转换为 4 * 36 个分类分数。
+        # 平均池化后，每张图片具有 32 * 12 * 22 个特征。
+        # 控制变量实验：只在全连接层前加入 Dropout(0.1)，训练时随机
+        # 丢弃 10% 的输入特征，其他模型结构和训练配置保持不变。
         # 这里不添加 Softmax，因为 CrossEntropyLoss 内部会完成相应计算。
-        self.classifier = nn.Linear(
-            in_features=32 * 25 * 45,
-            out_features=num_char * num_class,
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=0.1),
+            nn.Linear(
+                in_features=32 * 12 * 22,
+                out_features=num_char * num_class,
+            ),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """定义数据从输入到输出的前向传播过程。"""
-        # 卷积和池化后的形状为 [B, 32, 25, 45]。
+        # 卷积和平均池化后的形状为 [B, 32, 12, 22]。
         x = self.features(x)
 
         # 从第 1 维开始展平，保留第 0 维的批量大小：
-        # [B, 32, 25, 45] -> [B, 32 * 25 * 45]
+        # [B, 32, 12, 22] -> [B, 32 * 12 * 22]
         x = torch.flatten(x, start_dim=1)
 
         # 得到每张验证码的 4 * 36 个原始分类分数（logits）。

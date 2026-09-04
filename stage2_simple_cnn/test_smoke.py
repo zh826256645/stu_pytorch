@@ -22,8 +22,17 @@ images = image.unsqueeze(0)
 targets = target.unsqueeze(0)
 
 model = SimpleCaptchaCNN()
+assert isinstance(model.classifier[0], torch.nn.Dropout)
+assert model.classifier[0].p == 0.1
 logits = model(images)
 assert logits.shape == (1, 4, len(alphabet))
+
+# 在支持 MPS 的设备上执行真实前向传播，确保池化层和模型结构
+# 与实际训练设备兼容，避免训练开始后才发现后端支持问题。
+if torch.backends.mps.is_available():
+    mps_model = SimpleCaptchaCNN().to("mps")
+    mps_logits = mps_model(images.to("mps"))
+    assert mps_logits.shape == (1, 4, len(alphabet))
 
 # 检查损失可以计算并完成一次反向传播。
 criterion = torch.nn.CrossEntropyLoss()
