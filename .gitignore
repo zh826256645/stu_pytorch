@@ -5,3 +5,7 @@ __pycache__/
 *.py[cod]
 !uv.lock
 stage2_simple_cnn/checkpoints/
+stage2_simple_cnn/evaluation_reports/
+data/independent_test/
+data/synthetic_train/
+data/synthetic_validation/
