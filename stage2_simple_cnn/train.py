@@ -1,22 +1,30 @@
 import argparse
+import random
 from pathlib import Path
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-from torchvision.transforms import ToTensor
+from torchvision.transforms import ColorJitter, Compose, RandomAffine, ToTensor
 
 from datasets import CaptchaData, alphabet
 from training_config import TrainingConfig
 from training_curves import TrainingCurvePlotter
+from training_metrics import calculate_accuracy_counts
 
-from .models import SimpleCaptchaCNN
+from .models import (
+    DEFAULT_DROPOUT,
+    SUPPORTED_CLASSIFIER_HEADS,
+    SUPPORTED_CONV_BLOCKS,
+    SimpleCaptchaCNN,
+)
 
 # 当前验证码固定为 4 个字符。
 NUM_CHAR = 4
 # 字符集为 0-9 和 a-z，共 36 类。
 NUM_CLASS = len(alphabet)
 DEFAULT_MODEL_PATH = Path("stage2_simple_cnn/checkpoints/model.pth")
+DEFAULT_SEED = 0
 
 # 两个阶段共用 TrainingConfig 类，但第二阶段使用适合简单 CNN 的默认值。
 DEFAULT_TRAINING_CONFIG = TrainingConfig(
@@ -24,6 +32,31 @@ DEFAULT_TRAINING_CONFIG = TrainingConfig(
     batch_size=16,
     learning_rate=0.001,
 )
+# 验证 loss 连续若干轮没有改善时，把学习率降低到原来的 30%。
+PLATEAU_FACTOR = 0.3
+PLATEAU_PATIENCE = 3
+MIN_LEARNING_RATE = 1e-5
+DEFAULT_WEIGHT_DECAY = 0.0
+DEFAULT_LABEL_SMOOTHING = 0.0
+
+
+def set_random_seed(seed: int) -> None:
+    """设置 Python 和 PyTorch 随机种子。"""
+    if seed < 0:
+        raise ValueError("seed 必须大于等于 0")
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def is_better_checkpoint(
+    *,
+    accuracy: float,
+    loss: float,
+    best_accuracy: float,
+    best_loss: float,
+) -> bool:
+    """整图准确率优先；准确率相同时选择验证 loss 更低的模型。"""
+    return accuracy > best_accuracy or (accuracy == best_accuracy and loss < best_loss)
 
 
 def get_device() -> torch.device:
@@ -33,6 +66,74 @@ def get_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def build_image_transform(*, augment: bool, color_jitter: bool = False) -> Compose:
+    """构造图片预处理；训练时可选择几何和颜色增强。"""
+    transforms = []
+    if augment:
+        # 验证码不能翻转，也不宜大幅裁剪。这里只做很小的旋转、平移、缩放和错切，
+        # 模拟字符整体位置和书写角度变化，同时保持 4 个字符的顺序不变。
+        transforms.append(
+            RandomAffine(
+                degrees=3,
+                translate=(0.03, 0.05),
+                scale=(0.95, 1.05),
+                shear=3,
+                fill=255,
+            )
+        )
+    if color_jitter:
+        # 颜色不是验证码标签的一部分。轻微扰动亮度、对比度和色彩，帮助模型
+        # 更多关注字符形状，同时避免过强变化掩盖原本较细的字符笔画。
+        transforms.append(
+            ColorJitter(
+                brightness=0.15,
+                contrast=0.15,
+                saturation=0.15,
+                hue=0.02,
+            )
+        )
+    transforms.append(ToTensor())
+    return Compose(transforms)
+
+
+def build_optimizer(
+    model: nn.Module,
+    *,
+    learning_rate: float,
+    weight_decay: float,
+) -> torch.optim.Optimizer:
+    """构造优化器；启用权重衰减时使用解耦衰减的 AdamW。"""
+    if weight_decay < 0:
+        raise ValueError("weight_decay 必须大于等于 0")
+    if weight_decay == 0:
+        return torch.optim.Adam(model.parameters(), lr=learning_rate)
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+
+
+def build_criterion(*, label_smoothing: float) -> nn.CrossEntropyLoss:
+    """构造交叉熵损失，并限制标签平滑系数处于有效范围。"""
+    if not 0 <= label_smoothing < 1:
+        raise ValueError("label_smoothing 必须大于等于 0 且小于 1")
+    return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
+    """验证 loss 停止改善时自动降低学习率。"""
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=PLATEAU_FACTOR,
+        patience=PLATEAU_PATIENCE,
+        min_lr=MIN_LEARNING_RATE,
+    )
 
 
 def one_hot_to_class_indices(target: torch.Tensor) -> torch.Tensor:
@@ -64,29 +165,20 @@ def calculate_loss(
     )
 
 
-def count_correct_captchas(logits: torch.Tensor, target: torch.Tensor) -> int:
-    """统计整个验证码完全预测正确的图片数量。
-
-    只有 4 个字符全部正确，才把这张验证码记为正确。
-    """
-    predicted = logits.argmax(dim=2)
-    expected = one_hot_to_class_indices(target)
-    return (predicted == expected).all(dim=1).sum().item()
-
-
 def run_epoch(
     model: SimpleCaptchaCNN,
     data_loader: DataLoader,
     criterion: nn.CrossEntropyLoss,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
-) -> tuple[float, float]:
-    """运行一轮训练或验证，并返回平均 loss 和整图准确率。"""
+) -> tuple[float, float, float]:
+    """运行一轮训练或验证，并返回 loss、整图和单字符准确率。"""
     is_training = optimizer is not None
     model.train(is_training)
 
     total_loss = 0.0
-    total_correct = 0
+    total_correct_captchas = 0
+    total_correct_characters = 0
     total_images = 0
 
     # 训练时需要梯度；验证时关闭梯度可以节省内存和计算量。
@@ -108,26 +200,61 @@ def run_epoch(
                 optimizer.step()
 
             current_batch_size = images.size(0)
+            accuracy_counts = calculate_accuracy_counts(
+                logits,
+                targets,
+                num_char=NUM_CHAR,
+                num_class=NUM_CLASS,
+            )
             total_images += current_batch_size
             total_loss += loss.item() * current_batch_size
-            total_correct += count_correct_captchas(logits, targets)
+            total_correct_captchas += accuracy_counts.correct_captchas
+            total_correct_characters += accuracy_counts.correct_characters
 
-    return total_loss / total_images, total_correct / total_images
+    return (
+        total_loss / total_images,
+        total_correct_captchas / total_images,
+        total_correct_characters / (total_images * NUM_CHAR),
+    )
 
 
 def train(
     config: TrainingConfig = DEFAULT_TRAINING_CONFIG,
     model_path: Path = DEFAULT_MODEL_PATH,
+    *,
+    num_conv_blocks: int = 3,
+    bottleneck_channels: int | None = None,
+    classifier_head: str = "flatten",
+    dropout: float = DEFAULT_DROPOUT,
+    seed: int = DEFAULT_SEED,
+    augment: bool = False,
+    color_jitter: bool = False,
+    evaluate_clean_train: bool = False,
+    reduce_lr_on_plateau: bool = False,
+    weight_decay: float = DEFAULT_WEIGHT_DECAY,
+    label_smoothing: float = DEFAULT_LABEL_SMOOTHING,
 ) -> None:
-    """训练简单 CNN，并保存验证集表现最好的模型。"""
+    """训练指定结构的简单 CNN，并保存验证集最佳模型。"""
     # TrainingConfig 创建时已经统一检查 epochs、batch_size 和学习率。
-    torch.manual_seed(0)
+    set_random_seed(seed)
     device = get_device()
+    bottleneck_description = (
+        "关闭" if bottleneck_channels is None else str(bottleneck_channels)
+    )
+    optimizer_name = "AdamW" if weight_decay > 0 else "Adam"
     print(
-        f"使用设备：{device} | 训练轮数：{config.epochs} | "
-        f"批量大小：{config.batch_size} | 学习率：{config.learning_rate} | "
+        f"使用设备：{device} | 卷积块：{num_conv_blocks} | "
+        f"瓶颈通道：{bottleneck_description} | 分类头：{classifier_head} | "
+        f"Dropout：{dropout} | 训练轮数：{config.epochs} | "
+        f"批量大小：{config.batch_size} | "
+        f"初始学习率：{config.learning_rate} | 随机种子：{seed} | "
+        f"优化器：{optimizer_name} | 权重衰减：{weight_decay} | "
+        f"标签平滑：{label_smoothing} | "
+        f"学习率调度：{reduce_lr_on_plateau} | 几何增强：{augment} | "
+        f"颜色增强：{color_jitter} | 干净训练评估：{evaluate_clean_train} | "
         f"显示曲线：{config.plot_curves}"
     )
+    print(f"权重保存路径：{model_path}")
 
     # plot_curves=False 时，这个共用模块不会导入或打开 Matplotlib。
     curve_plotter = TrainingCurvePlotter(
@@ -135,16 +262,40 @@ def train(
         title="Simple CNN Training Curves",
     )
 
-    # ToTensor 会把 PIL 图片转换为 PyTorch 张量，并把像素值缩放到 0~1。
-    transform = ToTensor()
-    train_dataset = CaptchaData("./data/train", transform=transform)
-    test_dataset = CaptchaData("./data/test", transform=transform)
+    # 只增强训练集，验证集始终只执行 ToTensor，确保不同实验的指标可比较。
+    train_transform = build_image_transform(
+        augment=augment,
+        color_jitter=color_jitter,
+    )
+    validation_transform = build_image_transform(
+        augment=False,
+        color_jitter=False,
+    )
+    train_dataset = CaptchaData("./data/train", transform=train_transform)
+    clean_train_dataset = (
+        CaptchaData("./data/train", transform=validation_transform)
+        if evaluate_clean_train
+        else None
+    )
+    test_dataset = CaptchaData("./data/test", transform=validation_transform)
+    data_loader_generator = torch.Generator().manual_seed(seed)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=0,
+        generator=data_loader_generator,
+    )
+    clean_train_loader = (
+        DataLoader(
+            clean_train_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+        if clean_train_dataset is not None
+        else None
     )
     test_loader = DataLoader(
         test_dataset,
@@ -156,28 +307,48 @@ def train(
     model = SimpleCaptchaCNN(
         num_class=NUM_CLASS,
         num_char=NUM_CHAR,
+        num_conv_blocks=num_conv_blocks,
+        bottleneck_channels=bottleneck_channels,
+        classifier_head=classifier_head,
+        dropout=dropout,
     ).to(device)
 
-    # 每个字符位置都是一个 36 分类问题，因此使用交叉熵损失。
-    criterion = nn.CrossEntropyLoss()
-    # Adam 会根据计算出的梯度更新卷积层和全连接层的参数。
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=config.learning_rate,
+    # 每个字符位置都是一个 36 分类问题。标签平滑大于 0 时，
+    # 避免模型把训练标签拟合成过度自信的硬概率分布。
+    criterion = build_criterion(label_smoothing=label_smoothing)
+    # 权重衰减为 0 时保留历史 Adam 基线；大于 0 时使用 AdamW，
+    # 将权重衰减与梯度更新解耦，便于控制变量比较泛化效果。
+    optimizer = build_optimizer(
+        model,
+        learning_rate=config.learning_rate,
+        weight_decay=weight_decay,
     )
+    scheduler = build_lr_scheduler(optimizer) if reduce_lr_on_plateau else None
 
     model_path.parent.mkdir(parents=True, exist_ok=True)
     best_accuracy = -1.0
+    best_loss = float("inf")
 
     for epoch in range(1, config.epochs + 1):
-        train_loss, train_accuracy = run_epoch(
+        current_learning_rate = optimizer.param_groups[0]["lr"]
+        train_loss, train_accuracy, train_character_accuracy = run_epoch(
             model,
             train_loader,
             criterion,
             device,
             optimizer,
         )
-        test_loss, test_accuracy = run_epoch(
+        clean_train_metrics = (
+            run_epoch(
+                model,
+                clean_train_loader,
+                criterion,
+                device,
+            )
+            if clean_train_loader is not None
+            else None
+        )
+        test_loss, test_accuracy, test_character_accuracy = run_epoch(
             model,
             test_loader,
             criterion,
@@ -186,30 +357,71 @@ def train(
 
         print(
             f"第 {epoch:02d}/{config.epochs} 轮 | "
+            f"学习率: {current_learning_rate:.6f} | "
             f"训练 loss: {train_loss:.4f} | "
             f"训练整图准确率: {train_accuracy:.2%} | "
+            f"训练单字符准确率: {train_character_accuracy:.2%} | "
             f"验证 loss: {test_loss:.4f} | "
-            f"验证整图准确率: {test_accuracy:.2%}"
+            f"验证整图准确率: {test_accuracy:.2%} | "
+            f"验证单字符准确率: {test_character_accuracy:.2%}"
         )
 
-        # 两个阶段通过同一个绘图模块显示相同含义的指标。
+        if clean_train_metrics is not None:
+            (
+                clean_train_loss,
+                clean_train_accuracy,
+                clean_train_character_accuracy,
+            ) = clean_train_metrics
+            print(
+                f"第 {epoch:02d}/{config.epochs} 轮干净训练评估 | "
+                f"loss: {clean_train_loss:.4f} | "
+                f"整图准确率: {clean_train_accuracy:.2%} | "
+                f"单字符准确率: {clean_train_character_accuracy:.2%}"
+            )
+        else:
+            clean_train_loss = train_loss
+            clean_train_accuracy = train_accuracy
+            clean_train_character_accuracy = train_character_accuracy
+
+        # 启用干净训练评估时，曲线使用与验证集相同条件下的训练集指标。
         curve_plotter.update(
             epoch=epoch,
-            train_loss=train_loss,
+            train_loss=clean_train_loss,
             validation_loss=test_loss,
-            train_accuracy=train_accuracy,
+            train_accuracy=clean_train_accuracy,
             validation_accuracy=test_accuracy,
+            train_character_accuracy=clean_train_character_accuracy,
+            validation_character_accuracy=test_character_accuracy,
         )
 
-        # 只保存验证集整图准确率最高的权重。
-        if test_accuracy > best_accuracy:
+        if scheduler is not None:
+            previous_learning_rate = optimizer.param_groups[0]["lr"]
+            scheduler.step(test_loss)
+            next_learning_rate = optimizer.param_groups[0]["lr"]
+            if next_learning_rate < previous_learning_rate:
+                print(
+                    "验证 loss 停止改善，学习率调整："
+                    f"{previous_learning_rate:.6f} -> {next_learning_rate:.6f}"
+                )
+
+        # 优先保存验证集整图准确率更高的权重；准确率相同时选择 loss 更低者。
+        if is_better_checkpoint(
+            accuracy=test_accuracy,
+            loss=test_loss,
+            best_accuracy=best_accuracy,
+            best_loss=best_loss,
+        ):
             best_accuracy = test_accuracy
+            best_loss = test_loss
             torch.save(model.state_dict(), model_path)
             print(f"已保存当前最佳模型：{model_path}")
 
     # 启用 --plot-curves 时，训练结束后等待用户关闭曲线窗口。
     curve_plotter.show()
-    print(f"训练完成，最佳验证整图准确率：{best_accuracy:.2%}")
+    print(
+        f"训练完成，最佳验证整图准确率：{best_accuracy:.2%} | "
+        f"对应验证 loss：{best_loss:.4f} | 权重：{model_path}"
+    )
 
 
 if __name__ == "__main__":
@@ -220,11 +432,91 @@ if __name__ == "__main__":
         "--model-path",
         type=Path,
         default=DEFAULT_MODEL_PATH,
-        help="最佳模型权重保存路径",
+        help="最佳模型权重保存路径；默认覆盖第二阶段统一权重",
+    )
+    parser.add_argument(
+        "--conv-blocks",
+        type=int,
+        choices=SUPPORTED_CONV_BLOCKS,
+        default=3,
+        help="卷积块数量；默认 3，设置为 4 可进行深度消融实验",
+    )
+    parser.add_argument(
+        "--bottleneck-channels",
+        type=int,
+        default=None,
+        help="在分类头前用 1×1 卷积压缩到指定通道数；默认关闭",
+    )
+    parser.add_argument(
+        "--classifier-head",
+        choices=SUPPORTED_CLASSIFIER_HEADS,
+        default="flatten",
+        help="分类头类型：flatten 为历史展平头，position 为位置感知共享头",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=DEFAULT_DROPOUT,
+        help=f"分类头 Dropout 概率，设为 0 可关闭，默认 {DEFAULT_DROPOUT}",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help=f"随机种子，默认 {DEFAULT_SEED}",
+    )
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="仅对训练集启用轻量旋转、平移、缩放和错切增强",
+    )
+    parser.add_argument(
+        "--color-jitter",
+        action="store_true",
+        help="仅对训练集启用轻量亮度、对比度、饱和度和色相增强",
+    )
+    parser.add_argument(
+        "--evaluate-clean-train",
+        action="store_true",
+        help="每轮额外在关闭增强和 Dropout 后评估训练集",
+    )
+    parser.add_argument(
+        "--reduce-lr-on-plateau",
+        action="store_true",
+        help="验证 loss 停止改善时自动降低学习率",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=DEFAULT_WEIGHT_DECAY,
+        help=(
+            "AdamW 权重衰减系数；大于 0 时启用 AdamW，"
+            f"默认 {DEFAULT_WEIGHT_DECAY}（使用 Adam 基线）"
+        ),
+    )
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=DEFAULT_LABEL_SMOOTHING,
+        help=(
+            "交叉熵标签平滑系数，取值范围 [0, 1)，"
+            f"默认 {DEFAULT_LABEL_SMOOTHING}"
+        ),
     )
     args = parser.parse_args()
 
     train(
         config=TrainingConfig.from_namespace(args),
         model_path=args.model_path,
+        num_conv_blocks=args.conv_blocks,
+        bottleneck_channels=args.bottleneck_channels,
+        classifier_head=args.classifier_head,
+        dropout=args.dropout,
+        seed=args.seed,
+        augment=args.augment,
+        color_jitter=args.color_jitter,
+        evaluate_clean_train=args.evaluate_clean_train,
+        reduce_lr_on_plateau=args.reduce_lr_on_plateau,
+        weight_decay=args.weight_decay,
+        label_smoothing=args.label_smoothing,
     )
