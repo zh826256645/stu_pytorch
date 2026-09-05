@@ -5,17 +5,21 @@
 """
 
 import torch
-from torchvision.transforms import Compose, RandomAffine, ToTensor
+from torch.utils.data import DataLoader, Subset
+from torchvision.transforms import ColorJitter, Compose, RandomAffine, ToTensor
 
 from datasets import CaptchaData, alphabet
 from training_metrics import calculate_accuracy_counts
 
-from .models import SimpleCaptchaCNN
+from .models import HorizontalPositionPool, SimpleCaptchaCNN
 from .train import (
+    build_criterion,
     build_image_transform,
     build_lr_scheduler,
+    build_optimizer,
     calculate_loss,
     is_better_checkpoint,
+    run_epoch,
     set_random_seed,
 )
 
@@ -24,16 +28,62 @@ image, target = CaptchaData("./data/test", transform=ToTensor())[0]
 assert image.shape == (3, 100, 180)
 assert target.shape == (4 * len(alphabet),)
 
-# 训练增强只增加轻量仿射变换，验证预处理仍保持确定性。
-train_transform = build_image_transform(augment=True)
+# 几何和颜色增强可独立或同时启用，验证预处理仍保持确定性。
+geometric_transform = build_image_transform(augment=True)
+color_transform = build_image_transform(augment=False, color_jitter=True)
+combined_transform = build_image_transform(augment=True, color_jitter=True)
 validation_transform = build_image_transform(augment=False)
-assert isinstance(train_transform, Compose)
-assert isinstance(train_transform.transforms[0], RandomAffine)
-assert isinstance(train_transform.transforms[1], ToTensor)
+assert isinstance(geometric_transform, Compose)
+assert isinstance(geometric_transform.transforms[0], RandomAffine)
+assert isinstance(geometric_transform.transforms[1], ToTensor)
+assert isinstance(color_transform.transforms[0], ColorJitter)
+assert isinstance(color_transform.transforms[1], ToTensor)
+assert isinstance(combined_transform.transforms[0], RandomAffine)
+assert isinstance(combined_transform.transforms[1], ColorJitter)
+assert isinstance(combined_transform.transforms[2], ToTensor)
 assert len(validation_transform.transforms) == 1
 assert isinstance(validation_transform.transforms[0], ToTensor)
-augmented_image, _ = CaptchaData("./data/test", transform=train_transform)[0]
+augmented_image, _ = CaptchaData("./data/test", transform=combined_transform)[0]
 assert augmented_image.shape == image.shape
+
+# 权重衰减为 0 时保留 Adam 基线，大于 0 时启用 AdamW。
+optimizer_model = torch.nn.Linear(1, 1)
+baseline_optimizer = build_optimizer(
+    optimizer_model,
+    learning_rate=0.001,
+    weight_decay=0,
+)
+assert isinstance(baseline_optimizer, torch.optim.Adam)
+adamw_optimizer = build_optimizer(
+    optimizer_model,
+    learning_rate=0.001,
+    weight_decay=1e-4,
+)
+assert isinstance(adamw_optimizer, torch.optim.AdamW)
+assert adamw_optimizer.param_groups[0]["weight_decay"] == 1e-4
+try:
+    build_optimizer(
+        optimizer_model,
+        learning_rate=0.001,
+        weight_decay=-1e-4,
+    )
+except ValueError:
+    pass
+else:
+    raise AssertionError("负数 weight_decay 应抛出 ValueError")
+
+# 标签平滑默认关闭，启用时应传递给交叉熵损失，并拒绝无效范围。
+baseline_criterion = build_criterion(label_smoothing=0)
+assert baseline_criterion.label_smoothing == 0
+smoothed_criterion = build_criterion(label_smoothing=0.05)
+assert smoothed_criterion.label_smoothing == 0.05
+for invalid_label_smoothing in (-0.05, 1.0):
+    try:
+        build_criterion(label_smoothing=invalid_label_smoothing)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("无效的 label_smoothing 应抛出 ValueError")
 
 # 验证 loss 连续不改善时，调度器会把学习率降低到原来的 30%。
 scheduler_model = torch.nn.Linear(1, 1)
@@ -81,6 +131,9 @@ images = image.unsqueeze(0)
 targets = target.unsqueeze(0)
 
 model = SimpleCaptchaCNN()
+assert model.classifier_head == "flatten"
+assert model.dropout == 0.1
+assert isinstance(model.position_pool, torch.nn.Identity)
 convolution_layers = [
     layer for layer in model.features if isinstance(layer, torch.nn.Conv2d)
 ]
@@ -184,12 +237,69 @@ assert (
 best_candidate_logits = best_candidate_model(images)
 assert best_candidate_logits.shape == (1, 4, len(alphabet))
 
+# 位置感知头把横向特征汇聚成 4 个区域，并共享同一个 32 -> 36 分类器。
+position_head_model = SimpleCaptchaCNN(
+    num_conv_blocks=4,
+    bottleneck_channels=32,
+    classifier_head="position",
+)
+assert position_head_model.classifier_head == "position"
+assert position_head_model.feature_shape == (32, 3, 22)
+assert isinstance(position_head_model.position_pool, HorizontalPositionPool)
+assert position_head_model.position_pool.num_positions == 4
+assert isinstance(position_head_model.classifier[0], torch.nn.Dropout)
+assert position_head_model.classifier[0].p == 0.1
+assert isinstance(position_head_model.classifier[1], torch.nn.Linear)
+assert position_head_model.classifier[1].in_features == 32
+assert position_head_model.classifier[1].out_features == len(alphabet)
+assert (
+    sum(parameter.numel() for parameter in position_head_model.parameters())
+    == 103_300
+)
+position_head_logits = position_head_model(images)
+assert position_head_logits.shape == (1, 4, len(alphabet))
+
+# Dropout 概率可设置为 0 以关闭，也可在合法范围内调整。
+no_dropout_model = SimpleCaptchaCNN(dropout=0)
+assert no_dropout_model.dropout == 0
+assert no_dropout_model.classifier[0].p == 0
+for invalid_dropout in (-0.1, 1.0):
+    try:
+        SimpleCaptchaCNN(dropout=invalid_dropout)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("无效的 dropout 应抛出 ValueError")
+
+# 干净训练评估使用确定性预处理、eval 模式和无梯度验证路径。
+clean_train_subset = Subset(
+    CaptchaData("./data/train", transform=validation_transform),
+    range(2),
+)
+clean_train_loader = DataLoader(clean_train_subset, batch_size=2, shuffle=False)
+clean_train_metrics = run_epoch(
+    position_head_model,
+    clean_train_loader,
+    torch.nn.CrossEntropyLoss(),
+    torch.device("cpu"),
+)
+assert all(torch.isfinite(torch.tensor(value)) for value in clean_train_metrics)
+assert all(0 <= value <= 1 for value in clean_train_metrics[1:])
+assert not position_head_model.training
+
 try:
     SimpleCaptchaCNN(num_conv_blocks=5)
 except ValueError:
     pass
 else:
     raise AssertionError("不支持的卷积块数量应抛出 ValueError")
+
+try:
+    SimpleCaptchaCNN(classifier_head="unsupported")
+except ValueError:
+    pass
+else:
+    raise AssertionError("不支持的分类头应抛出 ValueError")
 
 for invalid_bottleneck_channels in (0, 65):
     try:
@@ -230,11 +340,22 @@ if torch.backends.mps.is_available():
     best_candidate_mps_logits = best_candidate_mps_model(mps_images)
     assert best_candidate_mps_logits.shape == (1, 4, len(alphabet))
 
+    position_head_mps_model = SimpleCaptchaCNN(
+        num_conv_blocks=4,
+        bottleneck_channels=32,
+        classifier_head="position",
+    ).to("mps")
+    position_head_mps_logits = position_head_mps_model(mps_images)
+    assert position_head_mps_logits.shape == (1, 4, len(alphabet))
+
 # 检查损失可以计算并完成一次反向传播。
 criterion = torch.nn.CrossEntropyLoss()
 loss = calculate_loss(logits, targets, criterion)
 assert torch.isfinite(loss)
 loss.backward()
+
+smoothed_loss = calculate_loss(logits.detach(), targets, smoothed_criterion)
+assert torch.isfinite(smoothed_loss)
 
 bottleneck_loss = calculate_loss(bottleneck_logits, targets, criterion)
 assert torch.isfinite(bottleneck_loss)
@@ -251,6 +372,10 @@ tiny_bottleneck_loss.backward()
 best_candidate_loss = calculate_loss(best_candidate_logits, targets, criterion)
 assert torch.isfinite(best_candidate_loss)
 best_candidate_loss.backward()
+
+position_head_loss = calculate_loss(position_head_logits, targets, criterion)
+assert torch.isfinite(position_head_loss)
+position_head_loss.backward()
 
 expected_indices = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]])
 predicted_indices = torch.tensor([[0, 1, 2, 3], [0, 1, 4, 5]])
