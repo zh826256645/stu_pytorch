@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 
+SUPPORTED_CONV_BLOCKS = (3, 4)
+
 
 class SimpleCaptchaCNN(nn.Module):
     """用于识别固定 4 位验证码的入门 CNN。
@@ -13,15 +15,30 @@ class SimpleCaptchaCNN(nn.Module):
 
     输出中的 4 表示验证码的 4 个字符位置，36 表示每个位置有
     0-9、a-z 共 36 个候选类别。
+
+    默认使用已经验证过的三个卷积块；实验时可通过 ``num_conv_blocks=4``
+    增加第四个卷积块。还可通过 ``bottleneck_channels`` 在全连接层前增加
+    1×1 卷积瓶颈，在不压缩空间尺寸的前提下减少分类头参数。
     """
 
-    def __init__(self, num_class: int = 36, num_char: int = 4):
+    def __init__(
+        self,
+        num_class: int = 36,
+        num_char: int = 4,
+        num_conv_blocks: int = 3,
+        bottleneck_channels: int | None = None,
+    ):
         super().__init__()
+        if num_conv_blocks not in SUPPORTED_CONV_BLOCKS:
+            supported = ", ".join(str(value) for value in SUPPORTED_CONV_BLOCKS)
+            raise ValueError(f"num_conv_blocks 必须是以下值之一：{supported}")
+
         self.num_class = num_class
         self.num_char = num_char
+        self.num_conv_blocks = num_conv_blocks
 
         # features 负责从原始 RGB 图片中提取图像特征。
-        self.features = nn.Sequential(
+        feature_layers: list[nn.Module] = [
             # 输入：[B, 3, 100, 180]
             # 3 是 RGB 三个颜色通道，16 是这一层输出的特征图数量。
             # padding=1 配合 3x3 卷积核，使图片的高和宽保持不变。
@@ -63,31 +80,82 @@ class SimpleCaptchaCNN(nn.Module):
             nn.ReLU(),
             # [B, 64, 25, 45] -> [B, 64, 12, 22]
             nn.MaxPool2d(kernel_size=2, stride=2),
-            # 只继续压缩高度，不压缩宽度，尽量保留 4 个字符的横向位置信息。
-            # 通道数翻倍后，64 * 6 * 22 与原来的 32 * 12 * 22 相同，
-            # 因而全连接层参数量保持不变，便于单独观察第三个卷积块的作用。
-            # [B, 64, 12, 22] -> [B, 64, 6, 22]
-            nn.AvgPool2d(kernel_size=(2, 1), stride=(2, 1)),
-        )
+        ]
 
-        # 池化后，每张图片具有 64 * 6 * 22 个特征。
-        # 实验结果表明 BatchNorm 与 Dropout(0.1) 组合的验证整图准确率最高。
+        if num_conv_blocks == 4:
+            feature_layers.extend(
+                [
+                    # 第四个卷积块把通道数从 64 增加到 128，并继续组合
+                    # 高层字符特征。只池化高度，保留横向字符位置信息：
+                    # [B, 64, 12, 22] -> [B, 128, 12, 22]
+                    nn.Conv2d(
+                        in_channels=64,
+                        out_channels=128,
+                        kernel_size=3,
+                        padding=1,
+                    ),
+                    nn.BatchNorm2d(128),
+                    nn.ReLU(),
+                    # [B, 128, 12, 22] -> [B, 128, 6, 22]
+                    nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),
+                    # [B, 128, 6, 22] -> [B, 128, 3, 22]
+                    nn.AvgPool2d(kernel_size=(2, 1), stride=(2, 1)),
+                ]
+            )
+            classifier_channels = 128
+            classifier_height = 3
+        else:
+            # 三卷积块基线只继续压缩高度，不压缩宽度。
+            # [B, 64, 12, 22] -> [B, 64, 6, 22]
+            feature_layers.append(nn.AvgPool2d(kernel_size=(2, 1), stride=(2, 1)))
+            classifier_channels = 64
+            classifier_height = 6
+
+        self.features = nn.Sequential(*feature_layers)
+
+        if bottleneck_channels is None:
+            # 默认不改变现有基线结构，确保旧权重仍可按三卷积块模型加载。
+            self.bottleneck = nn.Identity()
+            classifier_input_channels = classifier_channels
+        else:
+            if not 1 <= bottleneck_channels <= classifier_channels:
+                raise ValueError(
+                    "bottleneck_channels 必须大于等于 1，且不能超过卷积特征通道数 "
+                    f"{classifier_channels}"
+                )
+            # 1×1 卷积只压缩通道，不改变 6×22 或 3×22 的空间布局。
+            self.bottleneck = nn.Sequential(
+                nn.Conv2d(
+                    in_channels=classifier_channels,
+                    out_channels=bottleneck_channels,
+                    kernel_size=1,
+                ),
+                nn.BatchNorm2d(bottleneck_channels),
+                nn.ReLU(),
+            )
+            classifier_input_channels = bottleneck_channels
+
+        self.bottleneck_channels = bottleneck_channels
+        self.feature_shape = (classifier_input_channels, classifier_height, 22)
+        flattened_features = classifier_input_channels * classifier_height * 22
+
+        # 不使用瓶颈时，三块和四块结构池化后都具有 8448 个特征。
+        # 三块使用 32/16/8 通道瓶颈时，全连接层输入降为 4224/2112/1056。
         # 这里不添加 Softmax，因为 CrossEntropyLoss 内部会完成相应计算。
         self.classifier = nn.Sequential(
             nn.Dropout(p=0.1),
             nn.Linear(
-                in_features=64 * 6 * 22,
+                in_features=flattened_features,
                 out_features=num_char * num_class,
             ),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """定义数据从输入到输出的前向传播过程。"""
-        # 三个卷积块和池化后的形状为 [B, 64, 6, 22]。
         x = self.features(x)
+        x = self.bottleneck(x)
 
-        # 从第 1 维开始展平，保留第 0 维的批量大小：
-        # [B, 64, 6, 22] -> [B, 64 * 6 * 22]
+        # 从第 1 维开始展平，保留第 0 维的批量大小。
         x = torch.flatten(x, start_dim=1)
 
         # 得到每张验证码的 4 * 36 个原始分类分数（logits）。

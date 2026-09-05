@@ -1,4 +1,5 @@
 import argparse
+import random
 from pathlib import Path
 
 import torch
@@ -11,13 +12,14 @@ from training_config import TrainingConfig
 from training_curves import TrainingCurvePlotter
 from training_metrics import calculate_accuracy_counts
 
-from .models import SimpleCaptchaCNN
+from .models import SUPPORTED_CONV_BLOCKS, SimpleCaptchaCNN
 
 # 当前验证码固定为 4 个字符。
 NUM_CHAR = 4
 # 字符集为 0-9 和 a-z，共 36 类。
 NUM_CLASS = len(alphabet)
 DEFAULT_MODEL_PATH = Path("stage2_simple_cnn/checkpoints/model.pth")
+DEFAULT_SEED = 0
 
 # 两个阶段共用 TrainingConfig 类，但第二阶段使用适合简单 CNN 的默认值。
 DEFAULT_TRAINING_CONFIG = TrainingConfig(
@@ -29,6 +31,25 @@ DEFAULT_TRAINING_CONFIG = TrainingConfig(
 PLATEAU_FACTOR = 0.3
 PLATEAU_PATIENCE = 3
 MIN_LEARNING_RATE = 1e-5
+
+
+def set_random_seed(seed: int) -> None:
+    """设置 Python 和 PyTorch 随机种子。"""
+    if seed < 0:
+        raise ValueError("seed 必须大于等于 0")
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def is_better_checkpoint(
+    *,
+    accuracy: float,
+    loss: float,
+    best_accuracy: float,
+    best_loss: float,
+) -> bool:
+    """整图准确率优先；准确率相同时选择验证 loss 更低的模型。"""
+    return accuracy > best_accuracy or (accuracy == best_accuracy and loss < best_loss)
 
 
 def get_device() -> torch.device:
@@ -158,19 +179,28 @@ def train(
     config: TrainingConfig = DEFAULT_TRAINING_CONFIG,
     model_path: Path = DEFAULT_MODEL_PATH,
     *,
+    num_conv_blocks: int = 3,
+    bottleneck_channels: int | None = None,
+    seed: int = DEFAULT_SEED,
     augment: bool = False,
     reduce_lr_on_plateau: bool = False,
 ) -> None:
-    """训练简单 CNN，并保存验证集表现最好的模型。"""
+    """训练指定结构的简单 CNN，并保存验证集最佳模型。"""
     # TrainingConfig 创建时已经统一检查 epochs、batch_size 和学习率。
-    torch.manual_seed(0)
+    set_random_seed(seed)
     device = get_device()
+    bottleneck_description = (
+        "关闭" if bottleneck_channels is None else str(bottleneck_channels)
+    )
     print(
-        f"使用设备：{device} | 训练轮数：{config.epochs} | "
-        f"批量大小：{config.batch_size} | 初始学习率：{config.learning_rate} | "
+        f"使用设备：{device} | 卷积块：{num_conv_blocks} | "
+        f"瓶颈通道：{bottleneck_description} | "
+        f"训练轮数：{config.epochs} | 批量大小：{config.batch_size} | "
+        f"初始学习率：{config.learning_rate} | 随机种子：{seed} | "
         f"学习率调度：{reduce_lr_on_plateau} | 数据增强：{augment} | "
         f"显示曲线：{config.plot_curves}"
     )
+    print(f"权重保存路径：{model_path}")
 
     # plot_curves=False 时，这个共用模块不会导入或打开 Matplotlib。
     curve_plotter = TrainingCurvePlotter(
@@ -183,12 +213,14 @@ def train(
     validation_transform = build_image_transform(augment=False)
     train_dataset = CaptchaData("./data/train", transform=train_transform)
     test_dataset = CaptchaData("./data/test", transform=validation_transform)
+    data_loader_generator = torch.Generator().manual_seed(seed)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=0,
+        generator=data_loader_generator,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -200,6 +232,8 @@ def train(
     model = SimpleCaptchaCNN(
         num_class=NUM_CLASS,
         num_char=NUM_CHAR,
+        num_conv_blocks=num_conv_blocks,
+        bottleneck_channels=bottleneck_channels,
     ).to(device)
 
     # 每个字符位置都是一个 36 分类问题，因此使用交叉熵损失。
@@ -213,6 +247,7 @@ def train(
 
     model_path.parent.mkdir(parents=True, exist_ok=True)
     best_accuracy = -1.0
+    best_loss = float("inf")
 
     for epoch in range(1, config.epochs + 1):
         current_learning_rate = optimizer.param_groups[0]["lr"]
@@ -262,15 +297,24 @@ def train(
                     f"{previous_learning_rate:.6f} -> {next_learning_rate:.6f}"
                 )
 
-        # 只保存验证集整图准确率最高的权重。
-        if test_accuracy > best_accuracy:
+        # 优先保存验证集整图准确率更高的权重；准确率相同时选择 loss 更低者。
+        if is_better_checkpoint(
+            accuracy=test_accuracy,
+            loss=test_loss,
+            best_accuracy=best_accuracy,
+            best_loss=best_loss,
+        ):
             best_accuracy = test_accuracy
+            best_loss = test_loss
             torch.save(model.state_dict(), model_path)
             print(f"已保存当前最佳模型：{model_path}")
 
     # 启用 --plot-curves 时，训练结束后等待用户关闭曲线窗口。
     curve_plotter.show()
-    print(f"训练完成，最佳验证整图准确率：{best_accuracy:.2%}")
+    print(
+        f"训练完成，最佳验证整图准确率：{best_accuracy:.2%} | "
+        f"对应验证 loss：{best_loss:.4f} | 权重：{model_path}"
+    )
 
 
 if __name__ == "__main__":
@@ -281,7 +325,26 @@ if __name__ == "__main__":
         "--model-path",
         type=Path,
         default=DEFAULT_MODEL_PATH,
-        help="最佳模型权重保存路径",
+        help="最佳模型权重保存路径；默认覆盖第二阶段统一权重",
+    )
+    parser.add_argument(
+        "--conv-blocks",
+        type=int,
+        choices=SUPPORTED_CONV_BLOCKS,
+        default=3,
+        help="卷积块数量；默认 3，设置为 4 可进行深度消融实验",
+    )
+    parser.add_argument(
+        "--bottleneck-channels",
+        type=int,
+        default=None,
+        help="在全连接层前用 1×1 卷积压缩到指定通道数；默认关闭",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help=f"随机种子，默认 {DEFAULT_SEED}",
     )
     parser.add_argument(
         "--augment",
@@ -298,6 +361,9 @@ if __name__ == "__main__":
     train(
         config=TrainingConfig.from_namespace(args),
         model_path=args.model_path,
+        num_conv_blocks=args.conv_blocks,
+        bottleneck_channels=args.bottleneck_channels,
+        seed=args.seed,
         augment=args.augment,
         reduce_lr_on_plateau=args.reduce_lr_on_plateau,
     )
