@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torchvision.transforms import ColorJitter, Compose, RandomAffine, ToTensor
 
 from datasets import CaptchaData, alphabet
@@ -12,6 +12,7 @@ from training_config import TrainingConfig
 from training_curves import TrainingCurvePlotter
 from training_metrics import calculate_accuracy_counts
 
+from .data_loading import MixedBatchSampler
 from .models import (
     DEFAULT_DROPOUT,
     SUPPORTED_CLASSIFIER_HEADS,
@@ -24,6 +25,8 @@ NUM_CHAR = 4
 # 字符集为 0-9 和 a-z，共 36 类。
 NUM_CLASS = len(alphabet)
 DEFAULT_MODEL_PATH = Path("stage2_simple_cnn/checkpoints/model.pth")
+DEFAULT_TRAIN_DIR = Path("data/train")
+DEFAULT_VALIDATION_DIR = Path("data/test")
 DEFAULT_SEED = 0
 
 # 两个阶段共用 TrainingConfig 类，但第二阶段使用适合简单 CNN 的默认值。
@@ -96,6 +99,54 @@ def build_image_transform(*, augment: bool, color_jitter: bool = False) -> Compo
         )
     transforms.append(ToTensor())
     return Compose(transforms)
+
+
+def build_train_loader(
+    real_dataset: Dataset,
+    synthetic_dataset: Dataset | None,
+    *,
+    batch_size: int,
+    synthetic_ratio: float,
+    seed: int,
+) -> tuple[DataLoader, float]:
+    """构造真实数据基线或固定来源比例的混合训练加载器。"""
+    if not 0 <= synthetic_ratio < 1:
+        raise ValueError("synthetic_ratio 必须大于等于 0 且小于 1")
+    generator = torch.Generator().manual_seed(seed)
+
+    if synthetic_ratio == 0:
+        if synthetic_dataset is not None:
+            raise ValueError("synthetic_ratio 为 0 时不应提供 synthetic_dataset")
+        return (
+            DataLoader(
+                real_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0,
+                generator=generator,
+            ),
+            0.0,
+        )
+
+    if synthetic_dataset is None:
+        raise ValueError("synthetic_ratio 大于 0 时必须提供 synthetic_dataset")
+
+    combined_dataset = ConcatDataset([real_dataset, synthetic_dataset])
+    batch_sampler = MixedBatchSampler(
+        real_size=len(real_dataset),
+        synthetic_size=len(synthetic_dataset),
+        batch_size=batch_size,
+        synthetic_ratio=synthetic_ratio,
+        generator=generator,
+    )
+    return (
+        DataLoader(
+            combined_dataset,
+            batch_sampler=batch_sampler,
+            num_workers=0,
+        ),
+        batch_sampler.actual_synthetic_ratio,
+    )
 
 
 def build_optimizer(
@@ -233,9 +284,21 @@ def train(
     reduce_lr_on_plateau: bool = False,
     weight_decay: float = DEFAULT_WEIGHT_DECAY,
     label_smoothing: float = DEFAULT_LABEL_SMOOTHING,
+    train_dir: Path = DEFAULT_TRAIN_DIR,
+    validation_dir: Path = DEFAULT_VALIDATION_DIR,
+    synthetic_train_dir: Path | None = None,
+    synthetic_ratio: float = 0.0,
+    synthetic_validation_dir: Path | None = None,
 ) -> None:
     """训练指定结构的简单 CNN，并保存验证集最佳模型。"""
     # TrainingConfig 创建时已经统一检查 epochs、batch_size 和学习率。
+    if not 0 <= synthetic_ratio < 1:
+        raise ValueError("synthetic_ratio 必须大于等于 0 且小于 1")
+    if synthetic_ratio > 0 and synthetic_train_dir is None:
+        raise ValueError("启用合成训练比例时必须提供 synthetic_train_dir")
+    if synthetic_ratio == 0 and synthetic_train_dir is not None:
+        raise ValueError("提供 synthetic_train_dir 时 synthetic_ratio 必须大于 0")
+
     set_random_seed(seed)
     device = get_device()
     bottleneck_description = (
@@ -252,7 +315,13 @@ def train(
         f"标签平滑：{label_smoothing} | "
         f"学习率调度：{reduce_lr_on_plateau} | 几何增强：{augment} | "
         f"颜色增强：{color_jitter} | 干净训练评估：{evaluate_clean_train} | "
+        f"合成训练目标比例：{synthetic_ratio:.2%} | "
         f"显示曲线：{config.plot_curves}"
+    )
+    print(
+        f"真实训练集：{train_dir} | 原始验证集：{validation_dir} | "
+        f"合成训练集：{synthetic_train_dir or '关闭'} | "
+        f"合成验证集：{synthetic_validation_dir or '关闭'}"
     )
     print(f"权重保存路径：{model_path}")
 
@@ -271,21 +340,40 @@ def train(
         augment=False,
         color_jitter=False,
     )
-    train_dataset = CaptchaData("./data/train", transform=train_transform)
+    train_dataset = CaptchaData(str(train_dir), transform=train_transform)
+    synthetic_train_dataset = (
+        CaptchaData(str(synthetic_train_dir), transform=train_transform)
+        if synthetic_train_dir is not None
+        else None
+    )
     clean_train_dataset = (
-        CaptchaData("./data/train", transform=validation_transform)
+        CaptchaData(str(train_dir), transform=validation_transform)
         if evaluate_clean_train
         else None
     )
-    test_dataset = CaptchaData("./data/test", transform=validation_transform)
-    data_loader_generator = torch.Generator().manual_seed(seed)
+    validation_dataset = CaptchaData(
+        str(validation_dir),
+        transform=validation_transform,
+    )
+    synthetic_validation_dataset = (
+        CaptchaData(
+            str(synthetic_validation_dir),
+            transform=validation_transform,
+        )
+        if synthetic_validation_dir is not None
+        else None
+    )
 
-    train_loader = DataLoader(
+    train_loader, actual_synthetic_ratio = build_train_loader(
         train_dataset,
+        synthetic_train_dataset,
         batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=0,
-        generator=data_loader_generator,
+        synthetic_ratio=synthetic_ratio,
+        seed=seed,
+    )
+    print(
+        f"每轮训练批次数：{len(train_loader)} | "
+        f"实际批次合成比例：{actual_synthetic_ratio:.2%}"
     )
     clean_train_loader = (
         DataLoader(
@@ -297,11 +385,21 @@ def train(
         if clean_train_dataset is not None
         else None
     )
-    test_loader = DataLoader(
-        test_dataset,
+    validation_loader = DataLoader(
+        validation_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=0,
+    )
+    synthetic_validation_loader = (
+        DataLoader(
+            synthetic_validation_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+        if synthetic_validation_dataset is not None
+        else None
     )
 
     model = SimpleCaptchaCNN(
@@ -328,6 +426,7 @@ def train(
     model_path.parent.mkdir(parents=True, exist_ok=True)
     best_accuracy = -1.0
     best_loss = float("inf")
+    best_synthetic_accuracy: float | None = None
 
     for epoch in range(1, config.epochs + 1):
         current_learning_rate = optimizer.param_groups[0]["lr"]
@@ -348,11 +447,21 @@ def train(
             if clean_train_loader is not None
             else None
         )
-        test_loss, test_accuracy, test_character_accuracy = run_epoch(
+        validation_loss, validation_accuracy, validation_character_accuracy = run_epoch(
             model,
-            test_loader,
+            validation_loader,
             criterion,
             device,
+        )
+        synthetic_validation_metrics = (
+            run_epoch(
+                model,
+                synthetic_validation_loader,
+                criterion,
+                device,
+            )
+            if synthetic_validation_loader is not None
+            else None
         )
 
         print(
@@ -361,10 +470,23 @@ def train(
             f"训练 loss: {train_loss:.4f} | "
             f"训练整图准确率: {train_accuracy:.2%} | "
             f"训练单字符准确率: {train_character_accuracy:.2%} | "
-            f"验证 loss: {test_loss:.4f} | "
-            f"验证整图准确率: {test_accuracy:.2%} | "
-            f"验证单字符准确率: {test_character_accuracy:.2%}"
+            f"原始验证 loss: {validation_loss:.4f} | "
+            f"原始验证整图准确率: {validation_accuracy:.2%} | "
+            f"原始验证单字符准确率: {validation_character_accuracy:.2%}"
         )
+        if synthetic_validation_metrics is not None:
+            (
+                synthetic_validation_loss,
+                synthetic_validation_accuracy,
+                synthetic_validation_character_accuracy,
+            ) = synthetic_validation_metrics
+            print(
+                f"第 {epoch:02d}/{config.epochs} 轮合成验证 | "
+                f"loss: {synthetic_validation_loss:.4f} | "
+                f"整图准确率: {synthetic_validation_accuracy:.2%} | "
+                "单字符准确率: "
+                f"{synthetic_validation_character_accuracy:.2%}"
+            )
 
         if clean_train_metrics is not None:
             (
@@ -387,16 +509,16 @@ def train(
         curve_plotter.update(
             epoch=epoch,
             train_loss=clean_train_loss,
-            validation_loss=test_loss,
+            validation_loss=validation_loss,
             train_accuracy=clean_train_accuracy,
-            validation_accuracy=test_accuracy,
+            validation_accuracy=validation_accuracy,
             train_character_accuracy=clean_train_character_accuracy,
-            validation_character_accuracy=test_character_accuracy,
+            validation_character_accuracy=validation_character_accuracy,
         )
 
         if scheduler is not None:
             previous_learning_rate = optimizer.param_groups[0]["lr"]
-            scheduler.step(test_loss)
+            scheduler.step(validation_loss)
             next_learning_rate = optimizer.param_groups[0]["lr"]
             if next_learning_rate < previous_learning_rate:
                 print(
@@ -406,22 +528,30 @@ def train(
 
         # 优先保存验证集整图准确率更高的权重；准确率相同时选择 loss 更低者。
         if is_better_checkpoint(
-            accuracy=test_accuracy,
-            loss=test_loss,
+            accuracy=validation_accuracy,
+            loss=validation_loss,
             best_accuracy=best_accuracy,
             best_loss=best_loss,
         ):
-            best_accuracy = test_accuracy
-            best_loss = test_loss
+            best_accuracy = validation_accuracy
+            best_loss = validation_loss
+            best_synthetic_accuracy = (
+                synthetic_validation_metrics[1]
+                if synthetic_validation_metrics is not None
+                else None
+            )
             torch.save(model.state_dict(), model_path)
             print(f"已保存当前最佳模型：{model_path}")
 
     # 启用 --plot-curves 时，训练结束后等待用户关闭曲线窗口。
     curve_plotter.show()
-    print(
-        f"训练完成，最佳验证整图准确率：{best_accuracy:.2%} | "
-        f"对应验证 loss：{best_loss:.4f} | 权重：{model_path}"
+    summary = (
+        f"训练完成，最佳原始验证整图准确率：{best_accuracy:.2%} | "
+        f"对应验证 loss：{best_loss:.4f}"
     )
+    if best_synthetic_accuracy is not None:
+        summary += f" | 同轮合成验证整图准确率：{best_synthetic_accuracy:.2%}"
+    print(f"{summary} | 权重：{model_path}")
 
 
 if __name__ == "__main__":
@@ -433,6 +563,36 @@ if __name__ == "__main__":
         type=Path,
         default=DEFAULT_MODEL_PATH,
         help="最佳模型权重保存路径；默认覆盖第二阶段统一权重",
+    )
+    parser.add_argument(
+        "--train-dir",
+        type=Path,
+        default=DEFAULT_TRAIN_DIR,
+        help=f"真实训练集目录，默认 {DEFAULT_TRAIN_DIR}",
+    )
+    parser.add_argument(
+        "--validation-dir",
+        type=Path,
+        default=DEFAULT_VALIDATION_DIR,
+        help=f"原始分布验证集目录，默认 {DEFAULT_VALIDATION_DIR}",
+    )
+    parser.add_argument(
+        "--synthetic-train-dir",
+        type=Path,
+        default=None,
+        help="合成训练集目录；与 --synthetic-ratio 一起启用",
+    )
+    parser.add_argument(
+        "--synthetic-ratio",
+        type=float,
+        default=0.0,
+        help="每个训练批次中的合成样本目标比例，范围 [0, 1)，默认 0",
+    )
+    parser.add_argument(
+        "--synthetic-validation-dir",
+        type=Path,
+        default=None,
+        help="每轮额外评估的合成验证集目录",
     )
     parser.add_argument(
         "--conv-blocks",
@@ -498,10 +658,7 @@ if __name__ == "__main__":
         "--label-smoothing",
         type=float,
         default=DEFAULT_LABEL_SMOOTHING,
-        help=(
-            "交叉熵标签平滑系数，取值范围 [0, 1)，"
-            f"默认 {DEFAULT_LABEL_SMOOTHING}"
-        ),
+        help=(f"交叉熵标签平滑系数，取值范围 [0, 1)，默认 {DEFAULT_LABEL_SMOOTHING}"),
     )
     args = parser.parse_args()
 
@@ -519,4 +676,9 @@ if __name__ == "__main__":
         reduce_lr_on_plateau=args.reduce_lr_on_plateau,
         weight_decay=args.weight_decay,
         label_smoothing=args.label_smoothing,
+        train_dir=args.train_dir,
+        validation_dir=args.validation_dir,
+        synthetic_train_dir=args.synthetic_train_dir,
+        synthetic_ratio=args.synthetic_ratio,
+        synthetic_validation_dir=args.synthetic_validation_dir,
     )

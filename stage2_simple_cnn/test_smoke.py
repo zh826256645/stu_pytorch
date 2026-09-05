@@ -5,7 +5,7 @@
 """
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 from torchvision.transforms import ColorJitter, Compose, RandomAffine, ToTensor
 
 from datasets import CaptchaData, alphabet
@@ -17,6 +17,7 @@ from .train import (
     build_image_transform,
     build_lr_scheduler,
     build_optimizer,
+    build_train_loader,
     calculate_loss,
     is_better_checkpoint,
     run_epoch,
@@ -45,6 +46,31 @@ assert len(validation_transform.transforms) == 1
 assert isinstance(validation_transform.transforms[0], ToTensor)
 augmented_image, _ = CaptchaData("./data/test", transform=combined_transform)[0]
 assert augmented_image.shape == image.shape
+
+# 混合训练加载器在每个批次中保持真实/合成来源比例。
+real_dataset = TensorDataset(torch.zeros(8, 1))
+synthetic_dataset = TensorDataset(torch.ones(32, 1))
+mixed_loader, actual_synthetic_ratio = build_train_loader(
+    real_dataset,
+    synthetic_dataset,
+    batch_size=4,
+    synthetic_ratio=0.5,
+    seed=7,
+)
+assert actual_synthetic_ratio == 0.5
+for (source_markers,) in mixed_loader:
+    assert source_markers.shape == (4, 1)
+    assert source_markers.sum().item() == 2
+
+baseline_loader, baseline_synthetic_ratio = build_train_loader(
+    real_dataset,
+    None,
+    batch_size=4,
+    synthetic_ratio=0,
+    seed=7,
+)
+assert baseline_synthetic_ratio == 0
+assert len(baseline_loader.dataset) == len(real_dataset)
 
 # 权重衰减为 0 时保留 Adam 基线，大于 0 时启用 AdamW。
 optimizer_model = torch.nn.Linear(1, 1)
@@ -253,8 +279,7 @@ assert isinstance(position_head_model.classifier[1], torch.nn.Linear)
 assert position_head_model.classifier[1].in_features == 32
 assert position_head_model.classifier[1].out_features == len(alphabet)
 assert (
-    sum(parameter.numel() for parameter in position_head_model.parameters())
-    == 103_300
+    sum(parameter.numel() for parameter in position_head_model.parameters()) == 103_300
 )
 position_head_logits = position_head_model(images)
 assert position_head_logits.shape == (1, 4, len(alphabet))

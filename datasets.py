@@ -6,6 +6,7 @@ from torch.utils.data import Dataset
 
 alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
 DEFAULT_NUM_CLASS = len(alphabet)
+SUPPORTED_IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 
 def img_loader(img_path):
@@ -18,7 +19,10 @@ def make_dataset(data_path, alphabet, num_class, num_char):
     samples = []
     for img_name in sorted(os.listdir(data_path)):
         img_path = os.path.join(data_path, img_name)
-        target_str = img_name.split(".")[0]
+        suffix = os.path.splitext(img_name)[1].lower()
+        if not os.path.isfile(img_path) or suffix not in SUPPORTED_IMAGE_SUFFIXES:
+            continue
+        target_str = os.path.splitext(img_name)[0]
         if len(target_str) != num_char:
             raise ValueError(f"invalid label length: {img_name}")
 
