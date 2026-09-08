@@ -6,6 +6,8 @@ __pycache__/
 !uv.lock
 stage2_simple_cnn/checkpoints/
 stage3_variable_length/checkpoints/
+stage4_transformer_encoder/checkpoints/
+stage4_transformer_encoder/evaluation_reports/
 stage2_simple_cnn/evaluation_reports/
 stage3_variable_length/evaluation_reports/
 data/independent_test/
