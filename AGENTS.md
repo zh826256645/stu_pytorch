@@ -17,5 +17,5 @@ This repository uses the single-context domain-doc layout. See `docs/agents/doma
 This is a learning project. Training runs may overwrite the shared checkpoint for the
 relevant stage. Do not create or retain separate `.pth` files for each model parameter,
 architecture, or random seed unless the user explicitly requests it. Do not commit
-training-generated `.pth` files; record experiment settings and conclusions in
-`README.md` instead.
+training-generated `.pth` files; record experiment settings and conclusions in the
+corresponding stage document under `docs/stages/`, linked from `README.md`, instead.
